@@ -5,15 +5,15 @@ from typing import Any
 from kg_rag.config import HuggingFaceConfig
 
 
-def create_hf_chat_generator(config: HuggingFaceConfig) -> Any:
+def create_chat_generator(config: HuggingFaceConfig) -> Any:
     config.require_runtime_values()
-    from haystack.components.generators.chat import HuggingFaceAPIChatGenerator
+    from haystack.components.generators.chat import OpenAIChatGenerator
     from haystack.utils import Secret
 
-    return HuggingFaceAPIChatGenerator(
-        api_type="inference_endpoints",
-        api_params={"url": config.endpoint_url},
-        token=Secret.from_token(config.api_token),
+    return OpenAIChatGenerator(
+        api_key=Secret.from_token(config.api_token),
+        model=config.routed_model(),
+        api_base_url=config.base_url,
     )
 
 
@@ -33,8 +33,7 @@ def chat_reply_text(reply: Any) -> str:
         value = getattr(reply, attr, None)
         if isinstance(value, str):
             return value
-    text = str(reply)
-    return text
+    return str(reply)
 
 
 def run_chat(

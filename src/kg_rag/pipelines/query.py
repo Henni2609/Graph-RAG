@@ -8,7 +8,7 @@ from kg_rag.components.context_merger import ContextMerger
 from kg_rag.components.entity_extractor import parse_extraction_response
 from kg_rag.components.graph_retriever import GraphRetriever
 from kg_rag.config import RagConfig
-from kg_rag.llm import create_hf_chat_generator, run_chat
+from kg_rag.llm import create_chat_generator, run_chat
 from kg_rag.neo4j_store import Neo4jGraphStore
 
 
@@ -112,7 +112,7 @@ class QueryPipeline:
 
     def _generator(self) -> Any:
         if self.generator is None:
-            self.generator = create_hf_chat_generator(self.config.hf)
+            self.generator = create_chat_generator(self.config.hf)
         return self.generator
 
 

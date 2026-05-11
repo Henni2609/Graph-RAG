@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Graph RAG</title>
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1115;
+      color: #e4e6eb;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 14px 24px;
+      border-bottom: 1px solid #1f232b;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    header h1 {
+      font-size: 14px;
+      font-weight: 500;
+      letter-spacing: 0.4px;
+      color: #c9cdd6;
+    }
+    #status {
+      font-size: 12px;
+      color: #8b94a3;
+      font-variant-numeric: tabular-nums;
+    }
+    main {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+    }
+    aside {
+      width: 300px;
+      border-right: 1px solid #1f232b;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+    #drop-area {
+      flex-shrink: 0;
+      height: 200px;
+      border: 2px dashed #2a2f3a;
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 24px;
+      color: #6b7382;
+      font-size: 13px;
+      line-height: 1.5;
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+      user-select: none;
+    }
+    #drop-area:hover { border-color: #3a4252; color: #8b94a3; }
+    #drop-area.over { border-color: #4a90e2; color: #e4e6eb; background: #131720; }
+    #drop-area.busy { border-color: #c9a227; color: #c9a227; cursor: wait; }
+    #drop-area .hint { font-size: 11px; color: #4a5160; margin-top: 8px; }
+    .file-list {
+      list-style: none;
+      font-size: 12px;
+      color: #8b94a3;
+      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
+    }
+    .file-list li {
+      padding: 8px 0;
+      border-top: 1px solid #1f232b;
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .file-list li:first-child { border-top: none; }
+    .file-list .ok { color: #4ea860; flex-shrink: 0; }
+    .file-list .err { color: #e25c5c; flex-shrink: 0; }
+    .file-list .name { word-break: break-all; }
+    .file-list .meta { color: #4a5160; font-size: 11px; }
+    #graph {
+      flex: 1;
+      background: #0f1115;
+      min-width: 0;
+    }
+    #graph-empty {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #4a5160;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Graph RAG · Knowledge Graph</h1>
+    <span id="status">bereit</span>
+  </header>
+  <main>
+    <aside>
+      <div id="drop-area">
+        <div>PDF hierhin ziehen</div>
+        <div class="hint">oder klicken zum Auswählen</div>
+      </div>
+      <input type="file" id="file-input" accept="application/pdf" hidden />
+      <ul class="file-list" id="files"></ul>
+    </aside>
+    <section id="graph">
+      <div id="graph-empty">noch keine Entitäten</div>
+    </section>
+  </main>
+  <script>
+    const dropArea = document.getElementById('drop-area');
+    const fileInput = document.getElementById('file-input');
+    const statusEl = document.getElementById('status');
+    const filesEl = document.getElementById('files');
+    const graphEl = document.getElementById('graph');
+    const emptyEl = document.getElementById('graph-empty');
+
+    let network = null;
+
+    function setStatus(text, kind) {
+      statusEl.textContent = text;
+      statusEl.style.color = kind === 'error' ? '#e25c5c'
+        : kind === 'busy' ? '#c9a227'
+        : '#8b94a3';
+    }
+
+    function addFileEntry(name, meta, ok) {
+      const li = document.createElement('li');
+      const mark = document.createElement('span');
+      mark.className = ok ? 'ok' : 'err';
+      mark.textContent = ok ? '✓' : '✕';
+      const nameEl = document.createElement('span');
+      nameEl.className = 'name';
+      nameEl.textContent = name;
+      const metaEl = document.createElement('span');
+      metaEl.className = 'meta';
+      metaEl.textContent = meta;
+      li.append(mark, nameEl, metaEl);
+      filesEl.prepend(li);
+    }
+
+    function renderGraph(data) {
+      const nodes = (data.nodes || []).map(n => ({
+        id: n.id,
+        label: n.label,
+        title: n.description ? `${n.type} — ${n.description}` : n.type,
+      }));
+      const edges = (data.edges || []).map(e => ({
+        from: e.source,
+        to: e.target,
+        label: e.relation,
+      }));
+
+      if (nodes.length === 0) {
+        if (network) { network.destroy(); network = null; }
+        emptyEl.style.display = 'flex';
+        return;
+      }
+      emptyEl.style.display = 'none';
+
+      const visData = {
+        nodes: new vis.DataSet(nodes),
+        edges: new vis.DataSet(edges),
+      };
+      const options = {
+        interaction: { hover: true, tooltipDelay: 100 },
+        physics: {
+          solver: 'forceAtlas2Based',
+          forceAtlas2Based: { gravitationalConstant: -45, springLength: 110 },
+          stabilization: { iterations: 250 },
+        },
+        nodes: {
+          shape: 'dot',
+          size: 14,
+          borderWidth: 1,
+          color: {
+            background: '#1a2030',
+            border: '#4a90e2',
+            highlight: { background: '#243049', border: '#6fa8e8' },
+          },
+          font: { color: '#e4e6eb', size: 13, face: 'sans-serif' },
+        },
+        edges: {
+          arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+          color: { color: '#3a4252', highlight: '#6fa8e8' },
+          font: { color: '#6b7382', size: 10, strokeWidth: 0, align: 'middle' },
+          smooth: { type: 'continuous' },
+          width: 1,
+        },
+      };
+      if (network) network.destroy();
+      network = new vis.Network(graphEl, visData, options);
+    }
+
+    function graphSummary(data) {
+      const n = (data.nodes || []).length;
+      const e = (data.edges || []).length;
+      return `${n} Entität${n === 1 ? '' : 'en'} · ${e} Relation${e === 1 ? '' : 'en'}`;
+    }
+
+    async function loadGraph() {
+      try {
+        const res = await fetch('/api/graph');
+        const data = await res.json();
+        if (!res.ok) {
+          setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
+          return;
+        }
+        renderGraph(data);
+        setStatus(graphSummary(data));
+      } catch (err) {
+        setStatus(`Fehler: ${err.message}`, 'error');
+      }
+    }
+
+    async function upload(file) {
+      if (!file.name.toLowerCase().endsWith('.pdf')) {
+        setStatus('Nur PDF-Dateien erlaubt', 'error');
+        return;
+      }
+      const fd = new FormData();
+      fd.append('file', file);
+      dropArea.classList.add('busy');
+      setStatus(`Indexiere ${file.name} …`, 'busy');
+      try {
+        const res = await fetch('/api/upload', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) {
+          addFileEntry(file.name, data.detail || res.statusText, false);
+          setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
+          return;
+        }
+        addFileEntry(data.filename, `${data.chunks_indexed} Chunks`, true);
+        renderGraph(data.graph);
+        setStatus(graphSummary(data.graph));
+      } catch (err) {
+        addFileEntry(file.name, err.message, false);
+        setStatus(`Fehler: ${err.message}`, 'error');
+      } finally {
+        dropArea.classList.remove('busy');
+      }
+    }
+
+    dropArea.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', e => {
+      const f = e.target.files[0];
+      if (f) upload(f);
+      fileInput.value = '';
+    });
+
+    ['dragenter', 'dragover'].forEach(evt => {
+      dropArea.addEventListener(evt, e => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropArea.classList.add('over');
+      });
+    });
+    ['dragleave', 'drop'].forEach(evt => {
+      dropArea.addEventListener(evt, e => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropArea.classList.remove('over');
+      });
+    });
+    dropArea.addEventListener('drop', e => {
+      const f = e.dataTransfer.files[0];
+      if (f) upload(f);
+    });
+    document.addEventListener('dragover', e => e.preventDefault());
+    document.addEventListener('drop', e => e.preventDefault());
+
+    loadGraph();
+  </script>
+</body>
+</html>

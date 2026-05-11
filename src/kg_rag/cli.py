@@ -23,6 +23,8 @@ def main() -> None:
         index(args)
     elif args.command == "query":
         query(args)
+    elif args.command == "serve":
+        serve(args)
     else:
         parser.print_help()
 
@@ -43,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser.add_argument("--top-k", type=int, default=None)
     query_parser.add_argument("--hops", type=int, default=None)
     query_parser.add_argument("--show-context", action="store_true")
+
+    serve_parser = subparsers.add_parser("serve", help="Run the web UI for PDF upload and graph visualisation")
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8000)
     return parser
 
 
@@ -77,6 +83,13 @@ def query(args: argparse.Namespace) -> None:
             print(result.context)
     finally:
         pipeline.store.close()
+
+
+def serve(args: argparse.Namespace) -> None:
+    from kg_rag.web.app import run as run_web
+
+    logger.info(f"Starting web UI on http://{args.host}:{args.port}")
+    run_web(host=args.host, port=args.port)
 
 
 def load_dotenv(path: str | Path = ".env") -> None:

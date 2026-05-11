@@ -184,6 +184,33 @@ class Neo4jGraphStore:
         )
         return [document_from_record(record, source_label="graph") for record in records]
 
+    def fetch_entity_graph(self, *, limit: int = 500) -> dict[str, list[dict[str, Any]]]:
+        node_records = self.execute_read(
+            """
+            MATCH (e:Entity)
+            RETURN e.name_normalized AS id,
+                   coalesce(e.name, e.name_normalized) AS label,
+                   coalesce(e.type, 'Konzept') AS type,
+                   coalesce(e.description, '') AS description
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        edge_records = self.execute_read(
+            """
+            MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+            RETURN a.name_normalized AS source,
+                   b.name_normalized AS target,
+                   coalesce(r.relation, 'RELATES_TO') AS relation
+            LIMIT $edge_limit
+            """,
+            edge_limit=limit * 4,
+        )
+        return {
+            "nodes": [dict(record) for record in node_records],
+            "edges": [dict(record) for record in edge_records],
+        }
+
     def entity_context(self, entity_names: list[str], *, limit: int = 30) -> str:
         normalized_names = [normalize_entity_name(name) for name in entity_names if name]
         if not normalized_names:

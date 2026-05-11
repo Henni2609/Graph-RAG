@@ -11,30 +11,35 @@ def _get_int(name: str, default: int) -> int:
     return int(value)
 
 
+HF_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
+
+
 @dataclass(frozen=True)
 class HuggingFaceConfig:
     api_token: str
-    endpoint_url: str
-    generation_model: str = "google/gemma-4-31b-it"
-    entity_extraction_model: str = "google/gemma-4-31b-it"
+    provider: str = ""
+    generation_model: str = "meta-llama/Llama-3.3-70B-Instruct"
+    entity_extraction_model: str = "meta-llama/Llama-3.3-70B-Instruct"
+    base_url: str = HF_ROUTER_BASE_URL
 
     @classmethod
     def from_env(cls) -> "HuggingFaceConfig":
         return cls(
             api_token=os.getenv("HF_API_TOKEN", ""),
-            endpoint_url=os.getenv("HF_ENDPOINT_URL", ""),
-            generation_model=os.getenv("GENERATION_MODEL", "google/gemma-4-31b-it"),
-            entity_extraction_model=os.getenv("ENTITY_EXTRACTION_MODEL", "google/gemma-4-31b-it"),
+            provider=os.getenv("HF_PROVIDER", ""),
+            generation_model=os.getenv("GENERATION_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+            entity_extraction_model=os.getenv("ENTITY_EXTRACTION_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+            base_url=os.getenv("HF_BASE_URL", "") or HF_ROUTER_BASE_URL,
         )
 
+    def routed_model(self) -> str:
+        if self.provider:
+            return f"{self.generation_model}:{self.provider}"
+        return self.generation_model
+
     def require_runtime_values(self) -> None:
-        missing = []
         if not self.api_token:
-            missing.append("HF_API_TOKEN")
-        if not self.endpoint_url:
-            missing.append("HF_ENDPOINT_URL")
-        if missing:
-            raise RuntimeError(f"Missing required environment variable(s): {', '.join(missing)}")
+            raise RuntimeError("Missing required environment variable: HF_API_TOKEN")
 
 
 @dataclass(frozen=True)

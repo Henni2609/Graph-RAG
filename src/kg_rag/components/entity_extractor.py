@@ -6,7 +6,7 @@ from typing import Any
 
 from kg_rag.compat import Document, component, document_content, document_meta, make_document
 from kg_rag.config import HuggingFaceConfig
-from kg_rag.llm import create_hf_chat_generator, run_chat
+from kg_rag.llm import create_chat_generator, run_chat
 from kg_rag.logging import logger
 from kg_rag.schema import Entity, ExtractionResult, Relation
 
@@ -138,5 +138,5 @@ class EntityExtractor:
             return self.generator
         if self.hf_config is None:
             self.hf_config = HuggingFaceConfig.from_env()
-        self.generator = create_hf_chat_generator(self.hf_config)
+        self.generator = create_chat_generator(self.hf_config)
         return self.generator
