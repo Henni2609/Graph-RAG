@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from kg_rag.compat import Document, component, document_content, document_meta, make_document
-from kg_rag.config import HuggingFaceConfig
+from kg_rag.config import LLMConfig
 from kg_rag.llm import create_chat_generator, run_chat
 from kg_rag.logging import logger
 from kg_rag.schema import Entity, ExtractionResult, Relation
@@ -92,11 +92,11 @@ class EntityExtractor:
     def __init__(
         self,
         generator: Any | None = None,
-        hf_config: HuggingFaceConfig | None = None,
+        llm_config: LLMConfig | None = None,
         max_tokens: int = 800,
     ) -> None:
         self.generator = generator
-        self.hf_config = hf_config
+        self.llm_config = llm_config
         self.max_tokens = max_tokens
 
     @component.output_types(documents=list[Document])
@@ -136,7 +136,7 @@ class EntityExtractor:
     def _generator(self) -> Any:
         if self.generator is not None:
             return self.generator
-        if self.hf_config is None:
-            self.hf_config = HuggingFaceConfig.from_env()
-        self.generator = create_chat_generator(self.hf_config)
+        if self.llm_config is None:
+            self.llm_config = LLMConfig.from_env()
+        self.generator = create_chat_generator(self.llm_config)
         return self.generator

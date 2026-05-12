@@ -2,17 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from kg_rag.config import HuggingFaceConfig
+from kg_rag.config import LLMConfig
 
 
-def create_chat_generator(config: HuggingFaceConfig) -> Any:
+def create_chat_generator(config: LLMConfig) -> Any:
     config.require_runtime_values()
     from haystack.components.generators.chat import OpenAIChatGenerator
     from haystack.utils import Secret
 
     return OpenAIChatGenerator(
-        api_key=Secret.from_token(config.api_token),
-        model=config.routed_model(),
+        api_key=Secret.from_token(config.api_key),
+        model=config.model,
         api_base_url=config.base_url,
     )
 

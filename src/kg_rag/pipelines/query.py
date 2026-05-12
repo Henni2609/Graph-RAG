@@ -112,7 +112,7 @@ class QueryPipeline:
 
     def _generator(self) -> Any:
         if self.generator is None:
-            self.generator = create_chat_generator(self.config.hf)
+            self.generator = create_chat_generator(self.config.llm)
         return self.generator
 
 

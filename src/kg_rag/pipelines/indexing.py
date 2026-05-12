@@ -25,7 +25,7 @@ class IndexingPipeline:
         self.config = config
         self.store = store or Neo4jGraphStore(config.neo4j)
         self.entity_extractor = entity_extractor or EntityExtractor(
-            hf_config=config.hf,
+            llm_config=config.llm,
             max_tokens=config.entity_max_tokens,
         )
 

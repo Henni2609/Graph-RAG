@@ -64,9 +64,9 @@ The web UI lets you drag-and-drop PDFs and watch the knowledge graph grow.
 
 | Layer | Technology |
 | --- | --- |
-| LLM | HuggingFace Inference Providers via OpenAI-compatible router (`https://router.huggingface.co/v1`). Default model: `meta-llama/Llama-3.3-70B-Instruct`. |
+| LLM | DeepSeek API (OpenAI-compatible, `https://api.deepseek.com`). Default model: `deepseek-v4-pro`. Any OpenAI-compatible endpoint can be substituted via `LLM_BASE_URL`. |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (384 dim, cosine) |
-| Pipeline components | Haystack 2.x (`HuggingFaceAPIChatGenerator` → replaced by `OpenAIChatGenerator` pointed at the HF router; `SentenceTransformersDocumentEmbedder`, `DocumentSplitter`, etc.) |
+| Pipeline components | Haystack 2.x (`OpenAIChatGenerator` pointed at the DeepSeek API; `SentenceTransformersDocumentEmbedder`, `DocumentSplitter`, etc.) |
 | Graph DB | Neo4j 5+ |
 | Web backend | FastAPI + Uvicorn |
 | Frontend | Vanilla JS + `vis-network` 9.x (loaded from CDN) |
@@ -126,9 +126,9 @@ Triggered via `kg-rag query <question>` (no web search UI yet).
 src/kg_rag/
 ├── __init__.py
 ├── cli.py                       # argparse entry point: setup-schema, index, query, serve
-├── config.py                    # RagConfig + HuggingFaceConfig + Neo4jConfig
+├── config.py                    # RagConfig + LLMConfig + Neo4jConfig
 ├── compat.py                    # Haystack-version compatibility shims (Document, @component, ...)
-├── llm.py                       # create_chat_generator — Haystack OpenAIChatGenerator pointed at the HF router
+├── llm.py                       # create_chat_generator — Haystack OpenAIChatGenerator pointed at the DeepSeek API
 ├── logging.py                   # loguru setup
 ├── neo4j_store.py               # Neo4jGraphStore: schema, persist, vector_search, graph_search, entity_context, fetch_entity_graph
 ├── schema.py                    # Entity / Relation / ExtractionResult dataclasses + normalize_entity_name
@@ -145,7 +145,7 @@ src/kg_rag/
     └── static/
         └── index.html           # Drag-drop + vis-network visualization
 
-tests/                           # 14 tests, all with fakes; no Neo4j / HF / network required
+tests/                           # tests use fakes throughout; no Neo4j / DeepSeek / network required
 docs/                            # Example markdown to index
 docker-compose.yml               # Optional Docker-based Neo4j service
 pyproject.toml
@@ -170,11 +170,13 @@ Stop and start with `brew services stop neo4j` / `brew services start neo4j`.
 
 Alternatives: Neo4j Desktop (https://neo4j.com/download/), Neo4j Community ZIP, or `docker compose up -d neo4j` if you have Docker.
 
-### 2. Get a HuggingFace token
+### 2. Get a DeepSeek API key
 
-1. Create a **fine-grained** token at https://huggingface.co/settings/tokens with the scope **"Make calls to Inference Providers"**.
-2. Enable billing at https://huggingface.co/settings/billing and set a spending limit (e.g. \$5/month). Without billing, calls to non-free providers return HTTP 402.
-3. Optional: explicitly select a provider at https://huggingface.co/settings/inference-providers (or leave it to auto-routing).
+1. Create an API key at https://platform.deepseek.com/api_keys.
+2. Top up credits on the same dashboard — the API is pay-as-you-go and rejects requests once the balance hits zero.
+3. The default model is `deepseek-v4-pro`. Switch via `LLM_MODEL` (e.g. `deepseek-v4-flash` for cheaper/faster calls).
+
+Any OpenAI-compatible endpoint can be used instead by setting `LLM_BASE_URL` and `LLM_MODEL`.
 
 ### 3. Python environment
 
@@ -184,7 +186,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-This installs Haystack, the OpenAI SDK (used against the HF router), the Neo4j driver, sentence-transformers (which pulls PyTorch), FastAPI/Uvicorn, and the test toolchain.
+This installs Haystack, the OpenAI SDK (used against the DeepSeek API), the Neo4j driver, sentence-transformers (which pulls PyTorch), FastAPI/Uvicorn, and the test toolchain.
 
 ### 4. Configure
 
@@ -192,7 +194,7 @@ This installs Haystack, the OpenAI SDK (used against the HF router), the Neo4j d
 cp .env.example .env
 ```
 
-Edit `.env`. The only required entry is `HF_API_TOKEN`. Everything else has sensible defaults.
+Edit `.env`. The only required entry is `LLM_API_KEY`. Everything else has sensible defaults.
 
 ### 5. Create the Neo4j schema
 
@@ -223,21 +225,26 @@ kg-rag serve --host 127.0.0.1 --port 8000            # Start the web UI
 kg-rag serve
 ```
 
-Open http://127.0.0.1:8000/. The page:
-- Loads the current graph on first paint (`GET /api/graph`).
-- Accepts drag-and-drop or click-to-select PDF uploads (`POST /api/upload`).
-- During upload, shows an "Indexing …" status; on success, re-renders the graph and prepends the file to the sidebar history.
-- On any failure, surfaces the backend error message in both the sidebar entry and the top-right status.
+Open http://127.0.0.1:8000/. The page has two tabs in the header:
+
+- **Graph** — renders all entities and `RELATES_TO` edges via `vis-network`. Refreshes after every successful upload.
+- **Chat** — single-turn Q&A against the indexed corpus. Each answer is shown with chips reporting how many vector chunks and graph chunks fed the context, plus the entities the LLM extracted from the question.
+
+The sidebar with drag-and-drop PDF upload (`POST /api/upload`) is visible in both views. On any failure, the backend error is shown in the sidebar entry and the top-right status.
+
+API endpoints:
+- `GET /` — SPA
+- `GET /api/graph` — `{nodes, edges}`
+- `POST /api/upload` — multipart PDF, returns indexed-chunk count and refreshed graph
+- `POST /api/query` — JSON `{question, top_k?, hops?}` → `{answer, query_entities, vector_chunks, graph_chunks, context}`
 
 ## Environment variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `HF_API_TOKEN` | — (required) | Fine-grained HF token with Inference Providers scope |
-| `HF_PROVIDER` | empty | Force a specific provider: `together`, `fireworks-ai`, `sambanova`, `replicate`, `hyperbolic`, `cerebras`, `novita`. Empty = HF auto-routes |
-| `HF_BASE_URL` | `https://router.huggingface.co/v1` | OpenAI-compatible base URL (override for compatible proxies) |
-| `GENERATION_MODEL` | `meta-llama/Llama-3.3-70B-Instruct` | Model used for both extraction and answer generation |
-| `ENTITY_EXTRACTION_MODEL` | same as above | Reserved — currently unused (one generator is shared) |
+| `LLM_API_KEY` | — (required) | DeepSeek API key (or any OpenAI-compatible key when `LLM_BASE_URL` is overridden) |
+| `LLM_MODEL` | `deepseek-v4-pro` | Model ID. Other DeepSeek options: `deepseek-v4-flash` |
+| `LLM_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible base URL. Override to use a different provider |
 | `NEO4J_URI` | `bolt://localhost:7687` | |
 | `NEO4J_USERNAME` | `neo4j` | |
 | `NEO4J_PASSWORD` | `password123` | Must match the password you set with `neo4j-admin dbms set-initial-password` |
@@ -258,14 +265,14 @@ Open http://127.0.0.1:8000/. The page:
 pytest -q
 ```
 
-The 14 tests cover, with fakes throughout:
+The tests cover, with fakes throughout:
 - Local parsing and chunk-metadata normalization (`test_indexing_helpers.py`)
 - Context-merge dedup and budget (`test_context_merger.py`)
 - Entity-extraction JSON parsing, including dropped malformed relations (`test_entity_extractor.py`)
 - Neo4j writes — that `MERGE` statements for chunks, entities, relations, and `NEXT_CHUNK` are issued; that graph traversal clamps hops to 1–3 (`test_neo4j_store.py`)
-- Web endpoints — graph payload shape, upload validation, HTML serving (`test_web_app.py`)
+- Web endpoints — graph payload shape, upload validation, HTML serving, query endpoint with mocked pipeline (`test_web_app.py`)
 
-No Neo4j, no network, no HF token needed.
+No Neo4j, no network, no LLM key needed.
 
 ## How it differs from a vanilla RAG
 
@@ -281,12 +288,12 @@ Trade-offs to be aware of:
 
 ## Known limitations
 
-- `ENTITY_EXTRACTION_MODEL` is exposed in the config but currently ignored — one generator built from `GENERATION_MODEL` serves both call paths.
+- A single LLM generator serves both extraction and answer generation. To use a different model for extraction, override `LLM_MODEL` in the environment and wire a second generator manually.
 - Entity persistence issues one Cypher statement per entity and per relation. Indexing large corpora will be slow until this is batched.
 - No re-ranking stage between vector results and the LLM.
 - Entity identity uses `name_normalized` (casefold only). Aliases, plurals, and minor spelling variants are treated as distinct entities.
 - The web UI's upload history is in-page only — it resets on reload.
-- The query endpoint is CLI-only. The web UI is upload + visualization only, no chat.
+- The chat panel is single-turn — no conversation history is sent back to the LLM.
 
 ## Operations cheatsheet
 

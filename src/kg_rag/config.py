@@ -11,35 +11,27 @@ def _get_int(name: str, default: int) -> int:
     return int(value)
 
 
-HF_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_LLM_MODEL = "deepseek-v4-pro"
 
 
 @dataclass(frozen=True)
-class HuggingFaceConfig:
-    api_token: str
-    provider: str = ""
-    generation_model: str = "meta-llama/Llama-3.3-70B-Instruct"
-    entity_extraction_model: str = "meta-llama/Llama-3.3-70B-Instruct"
-    base_url: str = HF_ROUTER_BASE_URL
+class LLMConfig:
+    api_key: str
+    model: str = DEFAULT_LLM_MODEL
+    base_url: str = DEEPSEEK_BASE_URL
 
     @classmethod
-    def from_env(cls) -> "HuggingFaceConfig":
+    def from_env(cls) -> "LLMConfig":
         return cls(
-            api_token=os.getenv("HF_API_TOKEN", ""),
-            provider=os.getenv("HF_PROVIDER", ""),
-            generation_model=os.getenv("GENERATION_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
-            entity_extraction_model=os.getenv("ENTITY_EXTRACTION_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
-            base_url=os.getenv("HF_BASE_URL", "") or HF_ROUTER_BASE_URL,
+            api_key=os.getenv("LLM_API_KEY", ""),
+            model=os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL),
+            base_url=os.getenv("LLM_BASE_URL", "") or DEEPSEEK_BASE_URL,
         )
 
-    def routed_model(self) -> str:
-        if self.provider:
-            return f"{self.generation_model}:{self.provider}"
-        return self.generation_model
-
     def require_runtime_values(self) -> None:
-        if not self.api_token:
-            raise RuntimeError("Missing required environment variable: HF_API_TOKEN")
+        if not self.api_key:
+            raise RuntimeError("Missing required environment variable: LLM_API_KEY")
 
 
 @dataclass(frozen=True)
@@ -61,7 +53,7 @@ class Neo4jConfig:
 
 @dataclass(frozen=True)
 class RagConfig:
-    hf: HuggingFaceConfig
+    llm: LLMConfig
     neo4j: Neo4jConfig
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     chunk_split_length: int = 10
@@ -76,7 +68,7 @@ class RagConfig:
     @classmethod
     def from_env(cls) -> "RagConfig":
         return cls(
-            hf=HuggingFaceConfig.from_env(),
+            llm=LLMConfig.from_env(),
             neo4j=Neo4jConfig.from_env(),
             embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
             chunk_split_length=_get_int("CHUNK_SPLIT_LENGTH", 10),

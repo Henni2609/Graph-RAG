@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from kg_rag.compat import make_document
-from kg_rag.config import HuggingFaceConfig, Neo4jConfig, RagConfig
+from kg_rag.config import LLMConfig, Neo4jConfig, RagConfig
 from kg_rag.neo4j_store import Neo4jGraphStore
 from kg_rag.pipelines.query import QueryResult
 from kg_rag.web.app import create_app
@@ -52,7 +52,7 @@ class FakeDriver:
 
 def _build_config() -> RagConfig:
     return RagConfig(
-        hf=HuggingFaceConfig(api_token="hf_test"),
+        llm=LLMConfig(api_key="sk-test"),
         neo4j=Neo4jConfig(),
     )
 
