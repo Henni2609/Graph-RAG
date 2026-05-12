@@ -22,6 +22,7 @@
       justify-content: space-between;
       align-items: center;
       flex-shrink: 0;
+      gap: 16px;
     }
     header h1 {
       font-size: 14px;
@@ -29,6 +30,26 @@
       letter-spacing: 0.4px;
       color: #c9cdd6;
     }
+    .tabs {
+      display: flex;
+      gap: 4px;
+      background: #161a22;
+      border-radius: 8px;
+      padding: 3px;
+    }
+    .tab {
+      background: transparent;
+      color: #8b94a3;
+      border: none;
+      padding: 6px 14px;
+      font-size: 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      transition: background 0.15s, color 0.15s;
+    }
+    .tab:hover { color: #e4e6eb; }
+    .tab.active { background: #2a3142; color: #e4e6eb; }
     #status {
       font-size: 12px;
       color: #8b94a3;
@@ -90,6 +111,14 @@
     .file-list .err { color: #e25c5c; flex-shrink: 0; }
     .file-list .name { word-break: break-all; }
     .file-list .meta { color: #4a5160; font-size: 11px; }
+
+    .view {
+      flex: 1;
+      min-width: 0;
+      display: none;
+    }
+    .view.active { display: flex; }
+
     #graph {
       flex: 1;
       background: #0f1115;
@@ -104,11 +133,125 @@
       color: #4a5160;
       font-size: 13px;
     }
+
+    #chat {
+      flex-direction: column;
+      background: #0f1115;
+    }
+    #chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 32px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    #chat-empty {
+      margin: auto;
+      color: #4a5160;
+      font-size: 13px;
+      text-align: center;
+      line-height: 1.6;
+    }
+    #chat-empty .examples {
+      margin-top: 16px;
+      font-size: 12px;
+      color: #3a4252;
+    }
+    .msg {
+      max-width: 720px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: #2a3142;
+      color: #e4e6eb;
+      border-bottom-right-radius: 4px;
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: #161a22;
+      color: #c9cdd6;
+      border: 1px solid #1f232b;
+      border-bottom-left-radius: 4px;
+    }
+    .msg.assistant.error {
+      border-color: #4a2027;
+      color: #e25c5c;
+    }
+    .msg.assistant.pending { color: #6b7382; font-style: italic; }
+    .msg-meta {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid #1f232b;
+      font-size: 11px;
+      color: #4a5160;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .msg-meta .chip {
+      background: #0f1115;
+      padding: 2px 8px;
+      border-radius: 4px;
+      border: 1px solid #1f232b;
+    }
+
+    #chat-input-wrap {
+      border-top: 1px solid #1f232b;
+      padding: 16px 24px;
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+      flex-shrink: 0;
+    }
+    #chat-input {
+      flex: 1;
+      background: #161a22;
+      border: 1px solid #1f232b;
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #e4e6eb;
+      font-family: inherit;
+      font-size: 14px;
+      resize: none;
+      min-height: 42px;
+      max-height: 160px;
+      line-height: 1.5;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    #chat-input:focus { border-color: #4a90e2; }
+    #chat-input:disabled { opacity: 0.6; cursor: not-allowed; }
+    #chat-send {
+      background: #4a90e2;
+      color: #ffffff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 18px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      font-weight: 500;
+      height: 42px;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    #chat-send:hover:not(:disabled) { background: #5a9ce8; }
+    #chat-send:disabled { opacity: 0.4; cursor: not-allowed; }
   </style>
 </head>
 <body>
   <header>
     <h1>Graph RAG · Knowledge Graph</h1>
+    <div class="tabs" role="tablist">
+      <button class="tab active" id="tab-graph" data-view="graph" role="tab">Graph</button>
+      <button class="tab" id="tab-chat" data-view="chat" role="tab">Chat</button>
+    </div>
     <span id="status">bereit</span>
   </header>
   <main>
@@ -120,8 +263,28 @@
       <input type="file" id="file-input" accept="application/pdf" hidden />
       <ul class="file-list" id="files"></ul>
     </aside>
-    <section id="graph">
-      <div id="graph-empty">noch keine Entitäten</div>
+    <section id="view-graph" class="view active">
+      <div id="graph">
+        <div id="graph-empty">noch keine Entitäten</div>
+      </div>
+    </section>
+    <section id="view-chat" class="view">
+      <div id="chat" style="display:flex; flex:1; flex-direction:column; min-width:0;">
+        <div id="chat-messages">
+          <div id="chat-empty">
+            Stelle eine Frage zu den indexierten PDFs.
+            <div class="examples">z. B. „Welche Technologien werden im Dokument erwähnt?"</div>
+          </div>
+        </div>
+        <div id="chat-input-wrap">
+          <textarea
+            id="chat-input"
+            rows="1"
+            placeholder="Frage stellen … (Enter zum Senden, Shift+Enter für Zeilenumbruch)"
+          ></textarea>
+          <button id="chat-send" type="button">Senden</button>
+        </div>
+      </div>
     </section>
   </main>
   <script>
@@ -131,8 +294,18 @@
     const filesEl = document.getElementById('files');
     const graphEl = document.getElementById('graph');
     const emptyEl = document.getElementById('graph-empty');
+    const tabs = document.querySelectorAll('.tab');
+    const views = {
+      graph: document.getElementById('view-graph'),
+      chat: document.getElementById('view-chat'),
+    };
+    const chatMessages = document.getElementById('chat-messages');
+    const chatEmpty = document.getElementById('chat-empty');
+    const chatInput = document.getElementById('chat-input');
+    const chatSend = document.getElementById('chat-send');
 
     let network = null;
+    let chatBusy = false;
 
     function setStatus(text, kind) {
       statusEl.textContent = text;
@@ -140,6 +313,20 @@
         : kind === 'busy' ? '#c9a227'
         : '#8b94a3';
     }
+
+    function switchView(name) {
+      tabs.forEach(t => t.classList.toggle('active', t.dataset.view === name));
+      Object.entries(views).forEach(([key, el]) => {
+        el.classList.toggle('active', key === name);
+      });
+      if (name === 'chat') {
+        chatInput.focus();
+      }
+    }
+
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => switchView(tab.dataset.view));
+    });
 
     function addFileEntry(name, meta, ok) {
       const li = document.createElement('li');
@@ -257,6 +444,93 @@
         dropArea.classList.remove('busy');
       }
     }
+
+    function appendMessage(role, text, options = {}) {
+      if (chatEmpty && chatEmpty.parentNode) chatEmpty.remove();
+      const msg = document.createElement('div');
+      msg.className = `msg ${role}`;
+      if (options.error) msg.classList.add('error');
+      if (options.pending) msg.classList.add('pending');
+      msg.textContent = text;
+      if (options.meta) {
+        const meta = document.createElement('div');
+        meta.className = 'msg-meta';
+        options.meta.forEach(([label, value]) => {
+          const chip = document.createElement('span');
+          chip.className = 'chip';
+          chip.textContent = `${label}: ${value}`;
+          meta.appendChild(chip);
+        });
+        msg.appendChild(meta);
+      }
+      chatMessages.appendChild(msg);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+      return msg;
+    }
+
+    function setChatBusy(busy) {
+      chatBusy = busy;
+      chatInput.disabled = busy;
+      chatSend.disabled = busy;
+    }
+
+    async function sendChatMessage() {
+      const question = chatInput.value.trim();
+      if (!question || chatBusy) return;
+
+      appendMessage('user', question);
+      chatInput.value = '';
+      chatInput.style.height = 'auto';
+      setChatBusy(true);
+      setStatus('Frage wird verarbeitet …', 'busy');
+      const pending = appendMessage('assistant', 'denke nach …', { pending: true });
+
+      try {
+        const res = await fetch('/api/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+        });
+        const data = await res.json();
+        pending.remove();
+        if (!res.ok) {
+          appendMessage('assistant', data.detail || res.statusText, { error: true });
+          setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
+          return;
+        }
+        const meta = [];
+        if (typeof data.vector_chunks === 'number') {
+          meta.push(['Vector-Chunks', data.vector_chunks]);
+        }
+        if (typeof data.graph_chunks === 'number') {
+          meta.push(['Graph-Chunks', data.graph_chunks]);
+        }
+        if (Array.isArray(data.query_entities) && data.query_entities.length) {
+          meta.push(['Entitäten', data.query_entities.join(', ')]);
+        }
+        appendMessage('assistant', data.answer || '(leere Antwort)', { meta });
+        setStatus('Antwort geliefert');
+      } catch (err) {
+        pending.remove();
+        appendMessage('assistant', err.message, { error: true });
+        setStatus(`Fehler: ${err.message}`, 'error');
+      } finally {
+        setChatBusy(false);
+        chatInput.focus();
+      }
+    }
+
+    chatSend.addEventListener('click', sendChatMessage);
+    chatInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+    chatInput.addEventListener('input', () => {
+      chatInput.style.height = 'auto';
+      chatInput.style.height = Math.min(chatInput.scrollHeight, 160) + 'px';
+    });
 
     dropArea.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', e => {

@@ -7,15 +7,23 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from kg_rag.config import RagConfig
 from kg_rag.logging import logger
 from kg_rag.neo4j_store import Neo4jGraphStore
 from kg_rag.pipelines.indexing import IndexingPipeline
+from kg_rag.pipelines.query import QueryPipeline
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+class QueryRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    hops: int | None = Field(default=None, ge=1, le=3)
 
 
 def create_app(config: RagConfig | None = None) -> FastAPI:
@@ -33,6 +41,10 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
     @app.post("/api/upload")
     async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
         return await _handle_upload(file, app_config)
+
+    @app.post("/api/query")
+    def query(request: QueryRequest) -> dict[str, Any]:
+        return _handle_query(request, app_config)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
@@ -71,6 +83,29 @@ def _index_pdf_bytes(filename: str, contents: bytes, config: RagConfig) -> int:
             raise HTTPException(status_code=500, detail=f"Indexierung fehlgeschlagen: {exc}") from exc
         finally:
             pipeline.store.close()
+
+
+def _handle_query(request: QueryRequest, config: RagConfig) -> dict[str, Any]:
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Frage darf nicht leer sein")
+
+    pipeline = QueryPipeline(config)
+    try:
+        result = pipeline.run(question, top_k=request.top_k, hops=request.hops)
+    except Exception as exc:
+        logger.exception("Query failed")
+        raise HTTPException(status_code=500, detail=f"Anfrage fehlgeschlagen: {exc}") from exc
+    finally:
+        pipeline.store.close()
+
+    return {
+        "answer": result.answer,
+        "query_entities": result.query_entities,
+        "vector_chunks": len(result.vector_documents),
+        "graph_chunks": len(result.graph_documents),
+        "context": result.context,
+    }
 
 
 def _fetch_graph(config: RagConfig) -> dict[str, Any]:
