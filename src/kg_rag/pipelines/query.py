@@ -9,13 +9,22 @@ from kg_rag.components.entity_extractor import parse_extraction_response
 from kg_rag.components.graph_retriever import GraphRetriever
 from kg_rag.config import RagConfig
 from kg_rag.llm import create_chat_generator, run_chat
-from kg_rag.neo4j_store import Neo4jGraphStore
+from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore
 
 
 ANSWER_SYSTEM_PROMPT = """Du bist ein praeziser Graph-RAG-Assistent.
 Beantworte die Frage auf Deutsch oder Englisch passend zur Sprache der Frage.
 Nutze ausschliesslich den bereitgestellten Kontext. Wenn der Kontext nicht reicht, sage das klar.
-Referenziere relevante Quellen mit chunk_id, wenn du Fakten aus Chunks verwendest."""
+
+Struktur der Antwort:
+1. Beginne mit 1-2 Saetzen, die das Konzept klar definieren: was es ist und wozu es dient.
+2. Danach optional Stichpunkte oder kurze Absaetze mit relevanten Details.
+
+Zitiere Quellen kompakt im Format (Dateiname, Abschnitt N) oder mit den Kurz-Tags [S1], [S2],
+die im Kontext angegeben sind. Verwende niemals chunk_id-Hashes oder lange Hex-Strings.
+
+Nutze Markdown sparsam fuer Fett (**...**) und Listen (-). Vermeide Codebloecke, ueberlange
+Antworten und ausschweifende Wiederholungen."""
 
 
 QUERY_ENTITY_SYSTEM_PROMPT = """Extrahiere Entitaeten aus der Nutzerfrage.
@@ -52,7 +61,14 @@ class QueryPipeline:
             limit=config.graph_limit,
         )
 
-    def run(self, question: str, *, top_k: int | None = None, hops: int | None = None) -> QueryResult:
+    def run(
+        self,
+        question: str,
+        *,
+        top_k: int | None = None,
+        hops: int | None = None,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> QueryResult:
         generator = self._generator()
         query_entities = self.extract_query_entities(question, generator=generator)
         query_embedding = embed_query(question, model=self.config.embedding_model)
@@ -60,6 +76,7 @@ class QueryPipeline:
         vector_documents = self.store.vector_search(
             query_embedding,
             top_k=top_k if top_k is not None else self.config.query_top_k,
+            session_id=session_id,
         )
         chunk_ids = [
             str(document_meta(document).get("chunk_id"))
@@ -70,6 +87,7 @@ class QueryPipeline:
             chunk_ids=chunk_ids,
             query_entities=query_entities,
             hops=hops,
+            session_id=session_id,
         )
         graph_documents = graph_result["documents"]
         entity_context = graph_result["entity_context"]
@@ -92,12 +110,20 @@ class QueryPipeline:
         )
 
     def extract_query_entities(self, question: str, *, generator: Any) -> list[str]:
-        raw = run_chat(
-            generator,
-            QUERY_ENTITY_SYSTEM_PROMPT,
-            question,
-            generation_kwargs={"temperature": 0, "max_tokens": self.config.entity_max_tokens},
-        )
+        try:
+            raw = run_chat(
+                generator,
+                QUERY_ENTITY_SYSTEM_PROMPT,
+                question,
+                generation_kwargs={
+                    "temperature": 0,
+                    "max_tokens": 200,
+                    "timeout": 4,
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                },
+            )
+        except Exception:
+            return []
         result = parse_extraction_response(raw)
         return [entity.name for entity in result.entities]
 
@@ -107,12 +133,21 @@ class QueryPipeline:
             generator,
             ANSWER_SYSTEM_PROMPT,
             prompt,
-            generation_kwargs={"temperature": 0.2, "max_tokens": self.config.answer_max_tokens},
+            generation_kwargs={
+                "temperature": 0.2,
+                "max_tokens": self.config.answer_max_tokens,
+                "timeout": self.config.answer_timeout_seconds,
+                "extra_body": {"thinking": {"type": "disabled"}},
+            },
         )
 
     def _generator(self) -> Any:
         if self.generator is None:
-            self.generator = create_chat_generator(self.config.llm)
+            self.generator = create_chat_generator(
+                self.config.llm,
+                timeout=self.config.answer_timeout_seconds,
+                max_retries=0,
+            )
         return self.generator
 
 

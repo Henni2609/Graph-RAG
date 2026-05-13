@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 
 from kg_rag.compat import Document, document_content, document_embedding, document_meta, make_document
 from kg_rag.config import Neo4jConfig
@@ -14,6 +14,7 @@ from kg_rag.schema import normalize_entity_name
 
 VECTOR_INDEX_NAME = "chunk_embeddings"
 EMBEDDING_DIMENSIONS = 384
+DEFAULT_SESSION_ID = "default"
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class StoredChunk:
     document_id: str
     source: str
     title: str
+    session_id: str
 
 
 class Neo4jGraphStore:
@@ -50,13 +52,22 @@ class Neo4jGraphStore:
     def clear(self) -> None:
         self.execute_write("MATCH (n) DETACH DELETE n")
 
+    def delete_session(self, session_id: str) -> None:
+        if not session_id:
+            return
+        self.execute_write(
+            "MATCH (n) WHERE n.session_id = $session_id DETACH DELETE n",
+            session_id=session_id,
+        )
+
     def setup_schema(self) -> None:
         statements = [
+            "DROP CONSTRAINT entity_name_normalized IF EXISTS",
             "CREATE CONSTRAINT document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
             "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
             (
-                "CREATE CONSTRAINT entity_name_normalized IF NOT EXISTS "
-                "FOR (e:Entity) REQUIRE e.name_normalized IS UNIQUE"
+                "CREATE CONSTRAINT entity_name_session IF NOT EXISTS "
+                "FOR (e:Entity) REQUIRE (e.name_normalized, e.session_id) IS UNIQUE"
             ),
             (
                 f"CREATE VECTOR INDEX {VECTOR_INDEX_NAME} IF NOT EXISTS "
@@ -70,62 +81,172 @@ class Neo4jGraphStore:
         for statement in statements:
             self.execute_write(statement)
 
-    def persist_documents(self, documents: list[Document], *, overwrite: bool = False) -> None:
+    def persist_documents(
+        self,
+        documents: list[Document],
+        *,
+        overwrite: bool = False,
+        session_id: str = DEFAULT_SESSION_ID,
+        progress: Callable[[str, int, int], None] | None = None,
+        batch_size: int = 100,
+    ) -> None:
         if overwrite:
             self.clear()
             self.setup_schema()
 
-        chunks_by_document: dict[str, list[StoredChunk]] = defaultdict(list)
+        total_chunks = len(documents)
+        if progress is not None:
+            progress("persisting", 0, total_chunks)
+        if not documents:
+            return
 
+        stored_chunks: list[StoredChunk] = []
+        chunks_by_document: dict[str, list[StoredChunk]] = defaultdict(list)
+        chunk_metas: dict[str, dict[str, Any]] = {}
         for document in documents:
-            meta = document_meta(document)
-            chunk = stored_chunk_from_document(document)
+            chunk = stored_chunk_from_document(document, session_id=session_id)
+            stored_chunks.append(chunk)
             chunks_by_document[chunk.document_id].append(chunk)
+            chunk_metas[chunk.id] = document_meta(document)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 1) Batch: Documents + Chunks + HAS_CHUNK
+        done = 0
+        for batch in _chunks_of(stored_chunks, batch_size):
+            payload = [
+                {
+                    "document_id": c.document_id,
+                    "title": c.title,
+                    "source": c.source,
+                    "chunk_id": c.id,
+                    "text": c.text,
+                    "embedding": c.embedding,
+                    "chunk_index": c.chunk_index,
+                }
+                for c in batch
+            ]
             self.execute_write(
                 """
-                MERGE (d:Document {id: $document_id})
-                SET d.title = $title,
-                    d.source = $source,
-                    d.created_at = coalesce(d.created_at, $created_at),
+                UNWIND $chunks AS c
+                MERGE (d:Document {id: c.document_id})
+                  ON CREATE SET d.created_at = $created_at
+                SET d.title = c.title,
+                    d.source = c.source,
+                    d.session_id = $session_id,
                     d.updated_at = $created_at
-                MERGE (c:Chunk {id: $chunk_id})
-                SET c.text = $text,
-                    c.embedding = $embedding,
-                    c.chunk_index = $chunk_index,
-                    c.document_id = $document_id,
-                    c.source = $source,
-                    c.title = $title
-                MERGE (d)-[:HAS_CHUNK]->(c)
+                MERGE (chunk:Chunk {id: c.chunk_id})
+                SET chunk.text = c.text,
+                    chunk.embedding = c.embedding,
+                    chunk.chunk_index = c.chunk_index,
+                    chunk.document_id = c.document_id,
+                    chunk.source = c.source,
+                    chunk.title = c.title,
+                    chunk.session_id = $session_id
+                MERGE (d)-[:HAS_CHUNK]->(chunk)
                 """,
-                document_id=chunk.document_id,
-                title=chunk.title,
-                source=chunk.source,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                chunk_id=chunk.id,
-                text=chunk.text,
-                embedding=chunk.embedding,
-                chunk_index=chunk.chunk_index,
+                chunks=payload,
+                session_id=session_id,
+                created_at=now_iso,
             )
-            self._persist_entities_and_relations(chunk.id, meta)
+            done += len(batch)
+            if progress is not None:
+                progress("persisting", done, total_chunks)
 
+        # 2) Batch: Entities + MENTIONS
+        entities_payload: list[dict[str, Any]] = []
+        for chunk_id, meta in chunk_metas.items():
+            for entity in meta.get("entities") or []:
+                name = str(entity.get("name", "")).strip()
+                if not name:
+                    continue
+                entities_payload.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "name": name,
+                        "name_normalized": normalize_entity_name(name),
+                        "type": str(entity.get("type", "Konzept") or "Konzept"),
+                        "description": str(entity.get("description", "") or ""),
+                    }
+                )
+        for batch in _chunks_of(entities_payload, batch_size * 10):
+            self.execute_write(
+                """
+                UNWIND $entities AS row
+                MERGE (e:Entity {name_normalized: row.name_normalized, session_id: $session_id})
+                SET e.name = row.name,
+                    e.type = row.type,
+                    e.description = row.description
+                WITH e, row
+                MATCH (c:Chunk {id: row.chunk_id})
+                MERGE (c)-[:MENTIONS]->(e)
+                """,
+                entities=batch,
+                session_id=session_id,
+            )
+
+        # 3) Batch: RELATES_TO between entities
+        relations_payload: list[dict[str, Any]] = []
+        for chunk_id, meta in chunk_metas.items():
+            for relation in meta.get("relations") or []:
+                source = normalize_entity_name(str(relation.get("source", "")))
+                target = normalize_entity_name(str(relation.get("target", "")))
+                relation_type = str(relation.get("relation", "RELATES_TO") or "RELATES_TO")
+                if not source or not target:
+                    continue
+                relations_payload.append(
+                    {
+                        "source": source,
+                        "target": target,
+                        "relation": relation_type,
+                        "chunk_id": chunk_id,
+                    }
+                )
+        for batch in _chunks_of(relations_payload, batch_size * 10):
+            self.execute_write(
+                """
+                UNWIND $relations AS row
+                MATCH (source:Entity {name_normalized: row.source, session_id: $session_id})
+                MATCH (target:Entity {name_normalized: row.target, session_id: $session_id})
+                MERGE (source)-[rel:RELATES_TO {relation: row.relation, chunk_id: row.chunk_id}]->(target)
+                """,
+                relations=batch,
+                session_id=session_id,
+            )
+
+        # 4) Batch: NEXT_CHUNK edges
+        next_pairs: list[dict[str, str]] = []
         for chunks in chunks_by_document.values():
             ordered = sorted(chunks, key=lambda item: item.chunk_index)
             for previous, current in zip(ordered, ordered[1:]):
-                self.execute_write(
-                    """
-                    MATCH (previous:Chunk {id: $previous_id})
-                    MATCH (current:Chunk {id: $current_id})
-                    MERGE (previous)-[:NEXT_CHUNK]->(current)
-                    """,
-                    previous_id=previous.id,
-                    current_id=current.id,
-                )
+                next_pairs.append({"previous_id": previous.id, "current_id": current.id})
+        for batch in _chunks_of(next_pairs, batch_size * 10):
+            self.execute_write(
+                """
+                UNWIND $pairs AS pair
+                MATCH (previous:Chunk {id: pair.previous_id})
+                MATCH (current:Chunk {id: pair.current_id})
+                MERGE (previous)-[:NEXT_CHUNK]->(current)
+                """,
+                pairs=batch,
+            )
 
-    def vector_search(self, embedding: list[float], *, top_k: int = 5) -> list[Document]:
+        if progress is not None:
+            progress("persisting", total_chunks, total_chunks)
+
+    def vector_search(
+        self,
+        embedding: list[float],
+        *,
+        top_k: int = 5,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> list[Document]:
+        oversample = max(top_k * 5, top_k + 10)
         records = self.execute_read(
             f"""
-            CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
+            CALL db.index.vector.queryNodes($index_name, $oversample, $embedding)
             YIELD node, score
+            WHERE node.session_id = $session_id
             RETURN node.id AS id,
                    node.text AS text,
                    node.chunk_index AS chunk_index,
@@ -134,10 +255,13 @@ class Neo4jGraphStore:
                    node.title AS title,
                    score
             ORDER BY score DESC
+            LIMIT $top_k
             """,
             index_name=VECTOR_INDEX_NAME,
+            oversample=oversample,
             top_k=top_k,
             embedding=embedding,
+            session_id=session_id,
         )
         return [document_from_record(record, source_label="vector") for record in records]
 
@@ -148,15 +272,16 @@ class Neo4jGraphStore:
         query_entities: list[str] | None = None,
         hops: int = 2,
         limit: int = 8,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> list[Document]:
         hops = max(1, min(3, hops))
         normalized_entities = [normalize_entity_name(name) for name in query_entities or [] if name]
         records = self.execute_read(
             f"""
             MATCH (seed:Chunk)
-            WHERE seed.id IN $chunk_ids
+            WHERE seed.id IN $chunk_ids AND seed.session_id = $session_id
             MATCH (seed)-[:MENTIONS]->(:Entity)-[:RELATES_TO*1..{hops}]-(:Entity)<-[:MENTIONS]-(chunk:Chunk)
-            WHERE NOT chunk.id IN $chunk_ids
+            WHERE NOT chunk.id IN $chunk_ids AND chunk.session_id = $session_id
             RETURN DISTINCT chunk.id AS id,
                    chunk.text AS text,
                    chunk.chunk_index AS chunk_index,
@@ -167,8 +292,9 @@ class Neo4jGraphStore:
             UNION
             MATCH (query_entity:Entity)
             WHERE query_entity.name_normalized IN $query_entities
+              AND query_entity.session_id = $session_id
             MATCH (query_entity)-[:RELATES_TO*0..{hops}]-(:Entity)<-[:MENTIONS]-(chunk:Chunk)
-            WHERE NOT chunk.id IN $chunk_ids
+            WHERE NOT chunk.id IN $chunk_ids AND chunk.session_id = $session_id
             RETURN DISTINCT chunk.id AS id,
                    chunk.text AS text,
                    chunk.chunk_index AS chunk_index,
@@ -181,13 +307,20 @@ class Neo4jGraphStore:
             chunk_ids=chunk_ids,
             query_entities=normalized_entities,
             limit=limit,
+            session_id=session_id,
         )
         return [document_from_record(record, source_label="graph") for record in records]
 
-    def fetch_entity_graph(self, *, limit: int = 500) -> dict[str, list[dict[str, Any]]]:
+    def fetch_entity_graph(
+        self,
+        *,
+        limit: int = 500,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> dict[str, list[dict[str, Any]]]:
         node_records = self.execute_read(
             """
             MATCH (e:Entity)
+            WHERE e.session_id = $session_id
             RETURN e.name_normalized AS id,
                    coalesce(e.name, e.name_normalized) AS label,
                    coalesce(e.type, 'Konzept') AS type,
@@ -195,23 +328,32 @@ class Neo4jGraphStore:
             LIMIT $limit
             """,
             limit=limit,
+            session_id=session_id,
         )
         edge_records = self.execute_read(
             """
             MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+            WHERE a.session_id = $session_id AND b.session_id = $session_id
             RETURN a.name_normalized AS source,
                    b.name_normalized AS target,
                    coalesce(r.relation, 'RELATES_TO') AS relation
             LIMIT $edge_limit
             """,
             edge_limit=limit * 4,
+            session_id=session_id,
         )
         return {
             "nodes": [dict(record) for record in node_records],
             "edges": [dict(record) for record in edge_records],
         }
 
-    def entity_context(self, entity_names: list[str], *, limit: int = 30) -> str:
+    def entity_context(
+        self,
+        entity_names: list[str],
+        *,
+        limit: int = 30,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> str:
         normalized_names = [normalize_entity_name(name) for name in entity_names if name]
         if not normalized_names:
             return ""
@@ -219,8 +361,9 @@ class Neo4jGraphStore:
         records = self.execute_read(
             """
             MATCH (source:Entity)
-            WHERE source.name_normalized IN $names
+            WHERE source.name_normalized IN $names AND source.session_id = $session_id
             MATCH (source)-[rel:RELATES_TO]-(target:Entity)
+            WHERE target.session_id = $session_id
             RETURN DISTINCT source.name AS source,
                    coalesce(rel.relation, 'RELATES_TO') AS relation,
                    target.name AS target,
@@ -230,6 +373,7 @@ class Neo4jGraphStore:
             """,
             names=normalized_names,
             limit=limit,
+            session_id=session_id,
         )
         lines = []
         for record in records:
@@ -246,56 +390,29 @@ class Neo4jGraphStore:
             result = session.run(query, **parameters)
             return [dict(record) for record in result]
 
-    def _persist_entities_and_relations(self, chunk_id: str, meta: dict[str, Any]) -> None:
-        entities = meta.get("entities", []) or []
-        relations = meta.get("relations", []) or []
 
-        for entity in entities:
-            name = str(entity.get("name", "")).strip()
-            if not name:
-                continue
-            self.execute_write(
-                """
-                MATCH (c:Chunk {id: $chunk_id})
-                MERGE (e:Entity {name_normalized: $name_normalized})
-                SET e.name = $name,
-                    e.type = $type,
-                    e.description = $description
-                MERGE (c)-[:MENTIONS]->(e)
-                """,
-                chunk_id=chunk_id,
-                name=name,
-                name_normalized=normalize_entity_name(name),
-                type=str(entity.get("type", "Konzept") or "Konzept"),
-                description=str(entity.get("description", "") or ""),
-            )
-
-        for relation in relations:
-            source = normalize_entity_name(str(relation.get("source", "")))
-            target = normalize_entity_name(str(relation.get("target", "")))
-            relation_type = str(relation.get("relation", "RELATES_TO") or "RELATES_TO")
-            if not source or not target:
-                continue
-            self.execute_write(
-                """
-                MATCH (source:Entity {name_normalized: $source})
-                MATCH (target:Entity {name_normalized: $target})
-                MERGE (source)-[rel:RELATES_TO {relation: $relation, chunk_id: $chunk_id}]->(target)
-                """,
-                source=source,
-                target=target,
-                relation=relation_type,
-                chunk_id=chunk_id,
-            )
+def _chunks_of(items: list[Any], size: int) -> Iterator[list[Any]]:
+    if not items:
+        return
+    step = max(1, size)
+    for i in range(0, len(items), step):
+        yield items[i : i + step]
 
 
-def stored_chunk_from_document(document: Document) -> StoredChunk:
+def stored_chunk_from_document(
+    document: Document,
+    *,
+    session_id: str = DEFAULT_SESSION_ID,
+) -> StoredChunk:
     meta = document_meta(document)
     source = str(meta.get("source", "unknown"))
     title = str(meta.get("title") or Path(source).name or "Untitled")
-    document_id = str(meta.get("document_id") or stable_id(source))
+    document_id = str(meta.get("document_id") or stable_id(f"{session_id}|{source}"))
     chunk_index = int(meta.get("chunk_index", meta.get("split_idx", 0)) or 0)
-    chunk_id = str(meta.get("chunk_id") or stable_id(f"{document_id}:{chunk_index}:{document_content(document)}"))
+    chunk_id = str(
+        meta.get("chunk_id")
+        or stable_id(f"{session_id}|{document_id}|{chunk_index}|{document_content(document)}")
+    )
     return StoredChunk(
         id=chunk_id,
         text=document_content(document),
@@ -304,6 +421,7 @@ def stored_chunk_from_document(document: Document) -> StoredChunk:
         document_id=document_id,
         source=source,
         title=title,
+        session_id=session_id,
     )
 
 

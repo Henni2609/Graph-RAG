@@ -5,15 +5,28 @@ from typing import Any
 from kg_rag.config import LLMConfig
 
 
-def create_chat_generator(config: LLMConfig) -> Any:
+def create_chat_generator(
+    config: LLMConfig,
+    *,
+    model: str | None = None,
+    timeout: float | None = None,
+    max_retries: int | None = None,
+) -> Any:
     config.require_runtime_values()
     from haystack.components.generators.chat import OpenAIChatGenerator
     from haystack.utils import Secret
 
+    extra: dict[str, Any] = {}
+    if timeout is not None:
+        extra["timeout"] = timeout
+    if max_retries is not None:
+        extra["max_retries"] = max_retries
+
     return OpenAIChatGenerator(
         api_key=Secret.from_token(config.api_key),
-        model=config.model,
+        model=model or config.model,
         api_base_url=config.base_url,
+        **extra,
     )
 
 

@@ -102,12 +102,12 @@ Triggered via `kg-rag index <paths>` or `POST /api/upload`.
 1. **Load** — Haystack converters (`TextFileToDocument`, `PyPDFToDocument`) read `.txt`, `.md`, `.pdf`. Fallback loaders are used if Haystack converters fail to import.
 2. **Clean & split** — `DocumentCleaner` + `DocumentSplitter` produce sentence-based chunks with configurable length and overlap (default 10 / 2). A regex-based fallback handles environments without the Haystack splitter.
 3. **Embed** — `SentenceTransformersDocumentEmbedder` embeds each chunk into a 384-dim vector.
-4. **Extract** — for each chunk, the LLM is called with a strict JSON-only prompt that asks for `entities` (typed) and `relations` (source → target with a verb-like label). Malformed JSON returns an empty extraction. Relations whose source/target aren't in the chunk's entity list are dropped.
-5. **Persist** — single Cypher writes per chunk:
-   - `MERGE` the `Document` and `Chunk`, set properties, link `HAS_CHUNK`.
-   - `MERGE` each `Entity` by `name_normalized`, set properties, link `Chunk-[:MENTIONS]->Entity`.
-   - `MERGE` each `Entity-[:RELATES_TO {relation, chunk_id}]->Entity`.
-   - After all chunks of a document are written, link adjacent chunks with `NEXT_CHUNK` in `chunk_index` order.
+4. **Extract** — for each chunk, the LLM is called with a strict JSON-only prompt that asks for `entities` (typed) and `relations` (source → target with a verb-like label). Calls run in parallel with a bounded thread pool (`EXTRACTION_CONCURRENCY`, default 10) and use the lighter `LLM_EXTRACTION_MODEL` (default `deepseek-v4-flash`). Malformed JSON returns an empty extraction. Relations whose source/target aren't in the chunk's entity list are dropped.
+5. **Persist** — four batched `UNWIND` Cypher writes per indexing run, not per chunk:
+   - chunks batch: `MERGE` Document + Chunk + `HAS_CHUNK` for ~100 chunks at once.
+   - entities batch: `MERGE` each `Entity` by `(name_normalized, session_id)` and create the `MENTIONS` edge in a single pass.
+   - relations batch: `MERGE` `Entity-[:RELATES_TO {relation, chunk_id}]->Entity`.
+   - chunk-sequence batch: `MERGE` adjacent `Chunk-[:NEXT_CHUNK]->Chunk` pairs in `chunk_index` order.
 
 ### Query
 Triggered via `kg-rag query <question>` (no web search UI yet).
@@ -234,16 +234,19 @@ The sidebar with drag-and-drop PDF upload (`POST /api/upload`) is visible in bot
 
 API endpoints:
 - `GET /` — SPA
-- `GET /api/graph` — `{nodes, edges}`
-- `POST /api/upload` — multipart PDF, returns indexed-chunk count and refreshed graph
+- `GET /api/graph` — `{nodes, edges}` (requires `X-Session-Id` header)
+- `POST /api/upload` — multipart PDF. **Async**: returns `202` with `{job_id, filename, status: "queued", estimated_seconds}` immediately. The actual indexing runs on a background thread.
+- `GET /api/jobs/{job_id}` — returns the current `JobState`: `{status, step, current, total, chunks_indexed, error, graph, …}`. Steps cycle through `parsing → splitting → embedding → extracting → persisting → done`. The frontend polls this every 700 ms while a job is running. Jobs are session-scoped (cross-session access returns 404).
 - `POST /api/query` — JSON `{question, top_k?, hops?}` → `{answer, query_entities, vector_chunks, graph_chunks, context}`
+- `POST /api/session/end` — JSON `{session_id}` clears the session's data from Neo4j
 
 ## Environment variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LLM_API_KEY` | — (required) | DeepSeek API key (or any OpenAI-compatible key when `LLM_BASE_URL` is overridden) |
-| `LLM_MODEL` | `deepseek-v4-pro` | Model ID. Other DeepSeek options: `deepseek-v4-flash` |
+| `LLM_MODEL` | `deepseek-v4-pro` | Model for answer generation and query-side entity extraction |
+| `LLM_EXTRACTION_MODEL` | `deepseek-v4-flash` | Model used during indexing for per-chunk entity/relation extraction. Defaults to a cheaper/faster sibling |
 | `LLM_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible base URL. Override to use a different provider |
 | `NEO4J_URI` | `bolt://localhost:7687` | |
 | `NEO4J_USERNAME` | `neo4j` | |
@@ -257,7 +260,9 @@ API endpoints:
 | `GRAPH_LIMIT` | `8` | Max graph chunks returned per query |
 | `MAX_CONTEXT_CHARS` | `6000` | Char budget for the merged context block |
 | `ENTITY_MAX_TOKENS` | `800` | LLM output cap for entity extraction |
-| `ANSWER_MAX_TOKENS` | `1500` | LLM output cap for the final answer |
+| `ANSWER_MAX_TOKENS` | `500` | Output cap for the final answer. Sized so V4 Pro non-thinking (~60 chars/s) typically finishes in 7–11 s |
+| `ANSWER_TIMEOUT_SECONDS` | `11` | Hard per-request timeout for the answer-generation LLM call. Together with the 4 s budget for query-side entity extraction this targets a ≤15 s total `/api/query` round-trip |
+| `EXTRACTION_CONCURRENCY` | `10` | Parallel in-flight LLM calls during entity extraction. Raise for faster indexing if your provider tolerates it |
 
 ## Testing
 
@@ -288,8 +293,7 @@ Trade-offs to be aware of:
 
 ## Known limitations
 
-- A single LLM generator serves both extraction and answer generation. To use a different model for extraction, override `LLM_MODEL` in the environment and wire a second generator manually.
-- Entity persistence issues one Cypher statement per entity and per relation. Indexing large corpora will be slow until this is batched.
+- The `kg-rag serve` entry point clears the entire Neo4j database at startup (any in-flight indexing job would be lost on restart). This is convenient for the single-user dev workflow but unsafe for shared deployments.
 - No re-ranking stage between vector results and the LLM.
 - Entity identity uses `name_normalized` (casefold only). Aliases, plurals, and minor spelling variants are treated as distinct entities.
 - The web UI's upload history is in-page only — it resets on reload.

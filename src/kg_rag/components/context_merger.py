@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from typing import Any
 
 from kg_rag.compat import Document, component, document_content, document_meta
@@ -49,15 +50,14 @@ class ContextMerger:
         if entity_context.strip():
             sections.append("[Entity-Relationen]\n" + entity_context.strip())
 
-        for document in documents:
+        for index, document in enumerate(documents, start=1):
             meta = document_meta(document)
             retrieval_source = meta.get("retrieval_source", "vector")
             label = "Semantisch relevant" if retrieval_source == "vector" else "Via Graph-Traversal"
-            chunk_id = meta.get("chunk_id") or getattr(document, "id", "unknown")
-            source = meta.get("source", "unknown")
+            title = meta.get("title") or Path(str(meta.get("source", "unknown"))).name
             chunk_index = meta.get("chunk_index", "?")
             section = (
-                f"[{label}] chunk_id={chunk_id} source={source} chunk_index={chunk_index}\n"
+                f"[S{index}] [{label}] {title} · Abschnitt {chunk_index}\n"
                 f"{document_content(document).strip()}"
             )
             sections.append(section)

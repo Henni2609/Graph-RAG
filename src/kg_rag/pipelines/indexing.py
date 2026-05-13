@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from kg_rag.compat import Document, document_content, document_meta, make_document
 from kg_rag.components.entity_extractor import EntityExtractor
 from kg_rag.config import RagConfig
 from kg_rag.logging import logger
-from kg_rag.neo4j_store import Neo4jGraphStore, stable_id
+from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore, stable_id
+
+
+ProgressCallback = Callable[[str, int, int], None]
 
 
 SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf"}
@@ -27,25 +30,51 @@ class IndexingPipeline:
         self.entity_extractor = entity_extractor or EntityExtractor(
             llm_config=config.llm,
             max_tokens=config.entity_max_tokens,
+            concurrency=config.extraction_concurrency,
         )
 
-    def run(self, paths: Iterable[str | Path], *, overwrite: bool = False) -> int:
+    def run(
+        self,
+        paths: Iterable[str | Path],
+        *,
+        overwrite: bool = False,
+        session_id: str = DEFAULT_SESSION_ID,
+        progress: ProgressCallback | None = None,
+    ) -> int:
+        def emit(step: str, current: int = 0, total: int = 0) -> None:
+            if progress is not None:
+                progress(step, current, total)
+
         files = collect_supported_files(paths)
-        logger.info(f"Indexing {len(files)} file(s)")
+        logger.info(f"Indexing {len(files)} file(s) for session {session_id}")
         if not files:
+            emit("done", 0, 0)
             return 0
 
-        documents = load_documents(files)
+        emit("parsing")
+        documents = load_documents(files, session_id=session_id)
+
+        emit("splitting")
         chunks = split_documents(
             documents,
             split_length=self.config.chunk_split_length,
             split_overlap=self.config.chunk_split_overlap,
         )
-        chunks = normalize_chunk_metadata(chunks)
+        chunks = normalize_chunk_metadata(chunks, session_id=session_id)
+
+        emit("embedding", 0, len(chunks))
         embedded_chunks = embed_documents(chunks, model=self.config.embedding_model)
-        enriched_chunks = self.entity_extractor.run(embedded_chunks)["documents"]
+
+        enriched_chunks = self.entity_extractor.run(embedded_chunks, progress=progress)["documents"]
+
         self.store.setup_schema()
-        self.store.persist_documents(enriched_chunks, overwrite=overwrite)
+        self.store.persist_documents(
+            enriched_chunks,
+            overwrite=overwrite,
+            session_id=session_id,
+            progress=progress,
+        )
+        emit("done", len(enriched_chunks), len(enriched_chunks))
         return len(enriched_chunks)
 
 
@@ -66,12 +95,12 @@ def collect_supported_files(paths: Iterable[str | Path]) -> list[Path]:
     return sorted(dict.fromkeys(files))
 
 
-def load_documents(files: list[Path]) -> list[Document]:
+def load_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
     text_files = [path for path in files if path.suffix.lower() in {".txt", ".md"}]
     pdf_files = [path for path in files if path.suffix.lower() == ".pdf"]
     documents: list[Document] = []
-    documents.extend(_load_text_documents(text_files))
-    documents.extend(_load_pdf_documents(pdf_files))
+    documents.extend(_load_text_documents(text_files, session_id=session_id))
+    documents.extend(_load_pdf_documents(pdf_files, session_id=session_id))
     return documents
 
 
@@ -109,13 +138,17 @@ def embed_documents(documents: list[Document], *, model: str) -> list[Document]:
     return embedder.run(documents=documents)["documents"]
 
 
-def normalize_chunk_metadata(chunks: list[Document]) -> list[Document]:
+def normalize_chunk_metadata(
+    chunks: list[Document],
+    *,
+    session_id: str = DEFAULT_SESSION_ID,
+) -> list[Document]:
     counters: dict[str, int] = defaultdict(int)
     normalized: list[Document] = []
     for chunk in chunks:
         meta = document_meta(chunk)
         source = str(meta.get("source") or meta.get("file_path") or meta.get("path") or "unknown")
-        document_id = str(meta.get("document_id") or stable_id(source))
+        document_id = str(meta.get("document_id") or stable_id(f"{session_id}|{source}"))
         chunk_index = int(meta.get("chunk_index", meta.get("split_idx", counters[document_id])) or 0)
         counters[document_id] = max(counters[document_id], chunk_index + 1)
         meta.update(
@@ -124,8 +157,9 @@ def normalize_chunk_metadata(chunks: list[Document]) -> list[Document]:
                 "title": meta.get("title") or Path(source).name,
                 "document_id": document_id,
                 "chunk_index": chunk_index,
+                "session_id": session_id,
                 "chunk_id": meta.get("chunk_id")
-                or stable_id(f"{document_id}:{chunk_index}:{document_content(chunk)}"),
+                or stable_id(f"{session_id}|{document_id}|{chunk_index}|{document_content(chunk)}"),
             }
         )
         if getattr(chunk, "meta", None) is not None:
@@ -160,7 +194,7 @@ def fallback_sentence_split(
     return chunks
 
 
-def _load_text_documents(files: list[Path]) -> list[Document]:
+def _load_text_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
     if not files:
         return []
     try:
@@ -171,20 +205,20 @@ def _load_text_documents(files: list[Path]) -> list[Document]:
         documents = result["documents"]
         for index, document in enumerate(documents):
             source = _converted_source(document, files, index)
-            _attach_source_metadata(document, source)
+            _attach_source_metadata(document, source, session_id=session_id)
         return documents
     except Exception as exc:
         logger.warning(f"Haystack text converter unavailable, using fallback loader: {exc}")
         return [
             make_document(
                 path.read_text(encoding="utf-8"),
-                meta=_source_metadata(path),
+                meta=_source_metadata(path, session_id=session_id),
             )
             for path in files
         ]
 
 
-def _load_pdf_documents(files: list[Path]) -> list[Document]:
+def _load_pdf_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
     if not files:
         return []
     try:
@@ -195,7 +229,7 @@ def _load_pdf_documents(files: list[Path]) -> list[Document]:
         documents = result["documents"]
         for index, document in enumerate(documents):
             source = _converted_source(document, files, index)
-            _attach_source_metadata(document, source)
+            _attach_source_metadata(document, source, session_id=session_id)
         return documents
     except Exception as exc:
         logger.warning(f"Haystack PDF converter unavailable, using fallback loader: {exc}")
@@ -205,13 +239,13 @@ def _load_pdf_documents(files: list[Path]) -> list[Document]:
         for path in files:
             reader = PdfReader(str(path))
             text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            documents.append(make_document(text, meta=_source_metadata(path)))
+            documents.append(make_document(text, meta=_source_metadata(path, session_id=session_id)))
         return documents
 
 
-def _attach_source_metadata(document: Document, source: str) -> None:
+def _attach_source_metadata(document: Document, source: str, *, session_id: str) -> None:
     meta = document_meta(document)
-    meta.update(_source_metadata(Path(source)))
+    meta.update(_source_metadata(Path(source), session_id=session_id))
     document.meta = meta
 
 
@@ -225,10 +259,11 @@ def _converted_source(document: Document, files: list[Path], index: int) -> str:
     return "unknown"
 
 
-def _source_metadata(path: Path) -> dict[str, str]:
+def _source_metadata(path: Path, *, session_id: str = DEFAULT_SESSION_ID) -> dict[str, str]:
     source = str(path.expanduser().resolve())
     return {
         "source": source,
         "title": path.name,
-        "document_id": stable_id(source),
+        "document_id": stable_id(f"{session_id}|{source}"),
+        "session_id": session_id,
     }

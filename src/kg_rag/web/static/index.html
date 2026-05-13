@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Graph RAG</title>
   <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
@@ -91,6 +93,39 @@
     #drop-area.over { border-color: #4a90e2; color: #e4e6eb; background: #131720; }
     #drop-area.busy { border-color: #c9a227; color: #c9a227; cursor: wait; }
     #drop-area .hint { font-size: 11px; color: #4a5160; margin-top: 8px; }
+    #progress {
+      display: none;
+      margin-top: 4px;
+    }
+    #progress.visible { display: block; }
+    #progress .bar {
+      height: 4px;
+      background: #1f232b;
+      border-radius: 2px;
+      overflow: hidden;
+      position: relative;
+    }
+    #progress .fill {
+      height: 100%;
+      background: #4a90e2;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    #progress.indeterminate .fill {
+      width: 35%;
+      background: #c9a227;
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(285%); }
+    }
+    #progress .label {
+      margin-top: 6px;
+      font-size: 11px;
+      color: #8b94a3;
+      font-variant-numeric: tabular-nums;
+    }
     .file-list {
       list-style: none;
       font-size: 12px;
@@ -164,9 +199,24 @@
       border-radius: 12px;
       font-size: 14px;
       line-height: 1.55;
-      white-space: pre-wrap;
       word-wrap: break-word;
     }
+    .msg.user { white-space: pre-wrap; }
+    .msg.assistant.pending,
+    .msg.assistant.error { white-space: pre-wrap; }
+    .msg-body > *:first-child { margin-top: 0; }
+    .msg-body > *:last-child { margin-bottom: 0; }
+    .msg-body p { margin: 0 0 8px; }
+    .msg-body ul, .msg-body ol { margin: 4px 0 8px 20px; }
+    .msg-body li { margin: 2px 0; }
+    .msg-body strong { color: #e4e6eb; }
+    .msg-body code {
+      background: #0f1115;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 12.5px;
+    }
+    .msg-body a { color: #7aa2f7; text-decoration: underline; }
     .msg.user {
       align-self: flex-end;
       background: #2a3142;
@@ -261,6 +311,10 @@
         <div class="hint">oder klicken zum Auswählen</div>
       </div>
       <input type="file" id="file-input" accept="application/pdf" hidden />
+      <div id="progress">
+        <div class="bar"><div class="fill"></div></div>
+        <div class="label"></div>
+      </div>
       <ul class="file-list" id="files"></ul>
     </aside>
     <section id="view-graph" class="view active">
@@ -306,6 +360,27 @@
 
     let network = null;
     let chatBusy = false;
+
+    const SESSION_STORAGE_KEY = 'kg-rag-session-id';
+    function generateSessionId() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return 'sess-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+    function getSessionId() {
+      let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
+      if (!id) {
+        id = generateSessionId();
+        sessionStorage.setItem(SESSION_STORAGE_KEY, id);
+      }
+      return id;
+    }
+    const sessionId = getSessionId();
+
+    function sessionHeaders(extra) {
+      return Object.assign({ 'X-Session-Id': sessionId }, extra || {});
+    }
 
     function setStatus(text, kind) {
       statusEl.textContent = text;
@@ -404,17 +479,55 @@
 
     async function loadGraph() {
       try {
-        const res = await fetch('/api/graph');
+        const res = await fetch('/api/graph', { headers: sessionHeaders() });
         const data = await res.json();
         if (!res.ok) {
           setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
           return;
         }
         renderGraph(data);
-        setStatus(graphSummary(data));
+        const summary = graphSummary(data);
+        const n = (data.nodes || []).length;
+        setStatus(n === 0 ? 'bereit' : summary);
       } catch (err) {
         setStatus(`Fehler: ${err.message}`, 'error');
       }
+    }
+
+    const STEP_LABELS_DE = {
+      queued:     'Eingereiht',
+      parsing:    'PDF wird gelesen',
+      splitting:  'Text wird zerlegt',
+      embedding:  'Embeddings werden berechnet',
+      extracting: 'Entitäten werden extrahiert',
+      persisting: 'Wird im Graph gespeichert',
+      done:       'Fertig',
+      error:      'Fehler',
+    };
+    const DETERMINATE_STEPS = new Set(['extracting', 'persisting']);
+    const progressEl = document.getElementById('progress');
+    const progressFill = progressEl.querySelector('.fill');
+    const progressLabel = progressEl.querySelector('.label');
+    let activePoll = null;
+
+    function showProgress(step, current, total) {
+      progressEl.classList.add('visible');
+      const isDeterminate = DETERMINATE_STEPS.has(step) && total > 0;
+      progressEl.classList.toggle('indeterminate', !isDeterminate);
+      if (isDeterminate) {
+        const pct = Math.min(100, Math.round((current / total) * 100));
+        progressFill.style.width = pct + '%';
+        progressLabel.textContent = `${STEP_LABELS_DE[step] || step} · ${current}/${total}`;
+      } else {
+        progressFill.style.width = '0%';
+        progressLabel.textContent = STEP_LABELS_DE[step] || step;
+      }
+    }
+
+    function hideProgress() {
+      progressEl.classList.remove('visible', 'indeterminate');
+      progressFill.style.width = '0%';
+      progressLabel.textContent = '';
     }
 
     async function upload(file) {
@@ -422,27 +535,92 @@
         setStatus('Nur PDF-Dateien erlaubt', 'error');
         return;
       }
+      if (activePoll) {
+        clearInterval(activePoll);
+        activePoll = null;
+      }
       const fd = new FormData();
       fd.append('file', file);
       dropArea.classList.add('busy');
-      setStatus(`Indexiere ${file.name} …`, 'busy');
+      setStatus(`Lade ${file.name} hoch …`, 'busy');
+      showProgress('queued', 0, 0);
+      let job;
       try {
-        const res = await fetch('/api/upload', { method: 'POST', body: fd });
-        const data = await res.json();
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: sessionHeaders(),
+          body: fd,
+        });
+        job = await res.json();
         if (!res.ok) {
-          addFileEntry(file.name, data.detail || res.statusText, false);
-          setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
+          hideProgress();
+          dropArea.classList.remove('busy');
+          addFileEntry(file.name, job.detail || res.statusText, false);
+          setStatus(`Fehler: ${job.detail || res.statusText}`, 'error');
           return;
         }
-        addFileEntry(data.filename, `${data.chunks_indexed} Chunks`, true);
-        renderGraph(data.graph);
-        setStatus(graphSummary(data.graph));
       } catch (err) {
+        hideProgress();
+        dropArea.classList.remove('busy');
         addFileEntry(file.name, err.message, false);
         setStatus(`Fehler: ${err.message}`, 'error');
-      } finally {
-        dropArea.classList.remove('busy');
+        return;
       }
+      pollJob(job.job_id, job.filename, job.estimated_seconds || 120);
+    }
+
+    function pollJob(jobId, filename, etaSec) {
+      const intervalMs = 700;
+      const hardCapMs = Math.max(etaSec * 1500, 15 * 60 * 1000); // mind. 15 Min Puffer
+      const startedAt = Date.now();
+      setStatus(`${filename} wird indexiert …`, 'busy');
+
+      const tick = async () => {
+        if (Date.now() - startedAt > hardCapMs) {
+          clearInterval(activePoll);
+          activePoll = null;
+          hideProgress();
+          dropArea.classList.remove('busy');
+          addFileEntry(filename, 'Job-Zeitlimit überschritten', false);
+          setStatus('Job läuft länger als erwartet, prüfe Logs', 'error');
+          return;
+        }
+        try {
+          const res = await fetch(`/api/jobs/${jobId}`, { headers: sessionHeaders() });
+          const data = await res.json();
+          if (!res.ok) {
+            clearInterval(activePoll);
+            activePoll = null;
+            hideProgress();
+            dropArea.classList.remove('busy');
+            addFileEntry(filename, data.detail || res.statusText, false);
+            setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
+            return;
+          }
+          showProgress(data.step, data.current || 0, data.total || 0);
+          if (data.status === 'done') {
+            clearInterval(activePoll);
+            activePoll = null;
+            hideProgress();
+            dropArea.classList.remove('busy');
+            addFileEntry(filename, `${data.chunks_indexed} Chunks`, true);
+            if (data.graph) renderGraph(data.graph);
+            setStatus(data.graph ? graphSummary(data.graph) : 'Fertig');
+          } else if (data.status === 'error') {
+            clearInterval(activePoll);
+            activePoll = null;
+            hideProgress();
+            dropArea.classList.remove('busy');
+            addFileEntry(filename, data.error || 'Indexierung fehlgeschlagen', false);
+            setStatus(`Fehler: ${data.error || 'Indexierung fehlgeschlagen'}`, 'error');
+          }
+        } catch (err) {
+          // transienter Netzwerkfehler: Polling fortsetzen
+          console.warn('Job polling failed, retry:', err.message);
+        }
+      };
+      tick();
+      activePoll = setInterval(tick, intervalMs);
     }
 
     function appendMessage(role, text, options = {}) {
@@ -451,7 +629,16 @@
       msg.className = `msg ${role}`;
       if (options.error) msg.classList.add('error');
       if (options.pending) msg.classList.add('pending');
-      msg.textContent = text;
+      const renderMarkdown =
+        role === 'assistant' && !options.pending && !options.error;
+      if (renderMarkdown) {
+        const body = document.createElement('div');
+        body.className = 'msg-body';
+        body.innerHTML = DOMPurify.sanitize(marked.parse(text || ''));
+        msg.appendChild(body);
+      } else {
+        msg.textContent = text;
+      }
       if (options.meta) {
         const meta = document.createElement('div');
         meta.className = 'msg-meta';
@@ -488,7 +675,7 @@
       try {
         const res = await fetch('/api/query', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: sessionHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ question }),
         });
         const data = await res.json();
@@ -559,6 +746,22 @@
     });
     document.addEventListener('dragover', e => e.preventDefault());
     document.addEventListener('drop', e => e.preventDefault());
+
+    function endSession() {
+      const payload = JSON.stringify({ session_id: sessionId });
+      const blob = new Blob([payload], { type: 'application/json' });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon('/api/session/end', blob);
+      } else {
+        fetch('/api/session/end', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: payload,
+          keepalive: true,
+        }).catch(() => {});
+      }
+    }
+    window.addEventListener('pagehide', endSession);
 
     loadGraph();
   </script>

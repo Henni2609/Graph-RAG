@@ -4,7 +4,7 @@ from typing import Any
 
 from kg_rag.compat import Document, component
 from kg_rag.config import Neo4jConfig
-from kg_rag.neo4j_store import Neo4jGraphStore
+from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore
 
 
 @component
@@ -28,6 +28,7 @@ class GraphRetriever:
         query_entities: list[str] | None = None,
         hops: int | None = None,
         limit: int | None = None,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> dict[str, Any]:
         store = self._store()
         active_hops = max(1, min(3, hops if hops is not None else self.hops))
@@ -37,8 +38,9 @@ class GraphRetriever:
             query_entities=query_entities or [],
             hops=active_hops,
             limit=active_limit,
+            session_id=session_id,
         )
-        entity_context = store.entity_context(query_entities or [], limit=30)
+        entity_context = store.entity_context(query_entities or [], limit=30, session_id=session_id)
         return {"documents": documents, "entity_context": entity_context}
 
     def _store(self) -> Neo4jGraphStore:

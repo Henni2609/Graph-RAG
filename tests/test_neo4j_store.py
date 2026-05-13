@@ -70,11 +70,46 @@ def test_persist_documents_writes_chunks_entities_relations_and_next_edges() -> 
 
     store.persist_documents([first, second])
 
-    queries = "\n".join(query for query, params in driver.calls if query != "database")
-    assert "MERGE (c:Chunk {id: $chunk_id})" in queries
+    cypher_calls = [query for query, _params in driver.calls if query != "database"]
+    queries = "\n".join(cypher_calls)
+    assert "UNWIND $chunks AS c" in queries
+    assert "MERGE (chunk:Chunk {id: c.chunk_id})" in queries
+    assert "UNWIND $entities AS row" in queries
     assert "MERGE (c)-[:MENTIONS]->(e)" in queries
+    assert "UNWIND $relations AS row" in queries
     assert "MERGE (source)-[rel:RELATES_TO" in queries
+    assert "UNWIND $pairs AS pair" in queries
     assert "MERGE (previous)-[:NEXT_CHUNK]->(current)" in queries
+    # Genau vier UNWIND-Batches (chunks, entities, relations, next-pairs).
+    # Pro Pipeline-Run, nicht pro Chunk.
+    assert len(cypher_calls) == 4
+
+
+def test_persist_documents_invokes_progress_callback() -> None:
+    driver = FakeDriver()
+    store = Neo4jGraphStore(Neo4jConfig(), driver=driver)
+    documents = [
+        make_document(
+            f"text-{i}",
+            meta={
+                "source": "/tmp/doc.md",
+                "title": "doc.md",
+                "document_id": "doc-1",
+                "chunk_id": f"chunk-{i}",
+                "chunk_index": i,
+            },
+            embedding=[0.1] * 384,
+        )
+        for i in range(5)
+    ]
+    events: list[tuple[str, int, int]] = []
+    store.persist_documents(documents, progress=lambda step, c, t: events.append((step, c, t)))
+
+    assert events[0] == ("persisting", 0, 5)
+    assert events[-1] == ("persisting", 5, 5)
+    # Monoton steigend
+    counters = [c for _step, c, _t in events]
+    assert counters == sorted(counters)
 
 
 def test_graph_search_clamps_hops_to_three() -> None:

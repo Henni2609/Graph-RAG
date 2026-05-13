@@ -13,12 +13,14 @@ def _get_int(name: str, default: int) -> int:
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_LLM_MODEL = "deepseek-v4-pro"
+DEFAULT_EXTRACTION_MODEL = "deepseek-v4-flash"
 
 
 @dataclass(frozen=True)
 class LLMConfig:
     api_key: str
     model: str = DEFAULT_LLM_MODEL
+    extraction_model: str = DEFAULT_EXTRACTION_MODEL
     base_url: str = DEEPSEEK_BASE_URL
 
     @classmethod
@@ -26,6 +28,7 @@ class LLMConfig:
         return cls(
             api_key=os.getenv("LLM_API_KEY", ""),
             model=os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL),
+            extraction_model=os.getenv("LLM_EXTRACTION_MODEL", DEFAULT_EXTRACTION_MODEL),
             base_url=os.getenv("LLM_BASE_URL", "") or DEEPSEEK_BASE_URL,
         )
 
@@ -63,7 +66,9 @@ class RagConfig:
     graph_limit: int = 8
     max_context_chars: int = 6000
     entity_max_tokens: int = 800
-    answer_max_tokens: int = 1500
+    answer_max_tokens: int = 500
+    answer_timeout_seconds: int = 11
+    extraction_concurrency: int = 10
 
     @classmethod
     def from_env(cls) -> "RagConfig":
@@ -78,5 +83,7 @@ class RagConfig:
             graph_limit=_get_int("GRAPH_LIMIT", 8),
             max_context_chars=_get_int("MAX_CONTEXT_CHARS", 6000),
             entity_max_tokens=_get_int("ENTITY_MAX_TOKENS", 800),
-            answer_max_tokens=_get_int("ANSWER_MAX_TOKENS", 1500),
+            answer_max_tokens=_get_int("ANSWER_MAX_TOKENS", 500),
+            answer_timeout_seconds=_get_int("ANSWER_TIMEOUT_SECONDS", 11),
+            extraction_concurrency=_get_int("EXTRACTION_CONCURRENCY", 10),
         )
