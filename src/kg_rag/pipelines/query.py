@@ -17,7 +17,7 @@ Beantworte die Frage auf Deutsch oder Englisch passend zur Sprache der Frage.
 Nutze ausschliesslich den bereitgestellten Kontext. Wenn der Kontext nicht reicht, sage das klar.
 
 Struktur der Antwort:
-1. Beginne mit 1-2 Saetzen, die das Konzept klar definieren: was es ist und wozu es dient.
+1. Beginne mit Saetzen, die das Konzept klar definieren: was es ist und wozu es dient.
 2. Danach optional Stichpunkte oder kurze Absaetze mit relevanten Details.
 
 Zitiere Quellen kompakt im Format (Dateiname, Abschnitt N) oder mit den Kurz-Tags [S1], [S2],
@@ -40,6 +40,7 @@ class QueryResult:
     graph_documents: list[Document]
     entity_context: str
     query_entities: list[str]
+    citations: list[dict[str, Any]]
 
 
 class QueryPipeline:
@@ -98,6 +99,7 @@ class QueryPipeline:
             entity_context=entity_context,
         )
         context = merge_result["merged_context"]
+        citations = merge_result.get("citations", [])
         answer = self.generate_answer(question, context, generator=generator)
 
         return QueryResult(
@@ -107,6 +109,7 @@ class QueryPipeline:
             graph_documents=graph_documents,
             entity_context=entity_context,
             query_entities=query_entities,
+            citations=citations,
         )
 
     def extract_query_entities(self, question: str, *, generator: Any) -> list[str]:

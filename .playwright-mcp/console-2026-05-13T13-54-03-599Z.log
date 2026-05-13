@@ -1,0 +1,5 @@
+[  150878ms] [INFO] This network could not be positioned by this version of the improved layout algorithm. Please disable improvedLayout for better performance. @ https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js:32
+[  151939ms] [LOG] Deprecated API usage: The TextLayerRender `textContent`/`textContentStream` parameters will be removed in the future, please use `textContentSource` instead. @ https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js:21
+[  151940ms] [ERROR] The `--scale-factor` CSS-variable must be set, to the same value as `viewport.scale`, either on the `container`-element itself or higher up in the DOM. @ https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js:21
+[  188779ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8000/api/query:0
+[  441973ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8000/api/query:0

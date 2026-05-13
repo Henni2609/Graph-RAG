@@ -151,12 +151,18 @@ def normalize_chunk_metadata(
         document_id = str(meta.get("document_id") or stable_id(f"{session_id}|{source}"))
         chunk_index = int(meta.get("chunk_index", meta.get("split_idx", counters[document_id])) or 0)
         counters[document_id] = max(counters[document_id], chunk_index + 1)
+        page_number = meta.get("page_number")
+        try:
+            page_number = int(page_number) if page_number is not None else 1
+        except (TypeError, ValueError):
+            page_number = 1
         meta.update(
             {
                 "source": source,
                 "title": meta.get("title") or Path(source).name,
                 "document_id": document_id,
                 "chunk_index": chunk_index,
+                "page_number": max(1, page_number),
                 "session_id": session_id,
                 "chunk_id": meta.get("chunk_id")
                 or stable_id(f"{session_id}|{document_id}|{chunk_index}|{document_content(chunk)}"),

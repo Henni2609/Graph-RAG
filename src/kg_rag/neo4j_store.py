@@ -27,6 +27,7 @@ class StoredChunk:
     source: str
     title: str
     session_id: str
+    page_number: int = 1
 
 
 class Neo4jGraphStore:
@@ -123,6 +124,7 @@ class Neo4jGraphStore:
                     "text": c.text,
                     "embedding": c.embedding,
                     "chunk_index": c.chunk_index,
+                    "page_number": c.page_number,
                 }
                 for c in batch
             ]
@@ -139,6 +141,7 @@ class Neo4jGraphStore:
                 SET chunk.text = c.text,
                     chunk.embedding = c.embedding,
                     chunk.chunk_index = c.chunk_index,
+                    chunk.page_number = c.page_number,
                     chunk.document_id = c.document_id,
                     chunk.source = c.source,
                     chunk.title = c.title,
@@ -250,6 +253,7 @@ class Neo4jGraphStore:
             RETURN node.id AS id,
                    node.text AS text,
                    node.chunk_index AS chunk_index,
+                   node.page_number AS page_number,
                    node.document_id AS document_id,
                    node.source AS source,
                    node.title AS title,
@@ -285,6 +289,7 @@ class Neo4jGraphStore:
             RETURN DISTINCT chunk.id AS id,
                    chunk.text AS text,
                    chunk.chunk_index AS chunk_index,
+                   chunk.page_number AS page_number,
                    chunk.document_id AS document_id,
                    chunk.source AS source,
                    chunk.title AS title,
@@ -298,6 +303,7 @@ class Neo4jGraphStore:
             RETURN DISTINCT chunk.id AS id,
                    chunk.text AS text,
                    chunk.chunk_index AS chunk_index,
+                   chunk.page_number AS page_number,
                    chunk.document_id AS document_id,
                    chunk.source AS source,
                    chunk.title AS title,
@@ -409,6 +415,10 @@ def stored_chunk_from_document(
     title = str(meta.get("title") or Path(source).name or "Untitled")
     document_id = str(meta.get("document_id") or stable_id(f"{session_id}|{source}"))
     chunk_index = int(meta.get("chunk_index", meta.get("split_idx", 0)) or 0)
+    try:
+        page_number = int(meta.get("page_number") or 1)
+    except (TypeError, ValueError):
+        page_number = 1
     chunk_id = str(
         meta.get("chunk_id")
         or stable_id(f"{session_id}|{document_id}|{chunk_index}|{document_content(document)}")
@@ -422,15 +432,22 @@ def stored_chunk_from_document(
         source=source,
         title=title,
         session_id=session_id,
+        page_number=max(1, page_number),
     )
 
 
 def document_from_record(record: dict[str, Any], *, source_label: str) -> Document:
+    page_number = record.get("page_number")
+    try:
+        page_number = int(page_number) if page_number is not None else 1
+    except (TypeError, ValueError):
+        page_number = 1
     return make_document(
         record.get("text", "") or "",
         meta={
             "chunk_id": record.get("id"),
             "chunk_index": record.get("chunk_index"),
+            "page_number": max(1, page_number),
             "document_id": record.get("document_id"),
             "source": record.get("source"),
             "title": record.get("title"),

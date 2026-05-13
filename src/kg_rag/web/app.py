@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -17,14 +19,16 @@ from pydantic import BaseModel, Field
 
 from kg_rag.config import RagConfig
 from kg_rag.logging import logger
-from kg_rag.neo4j_store import Neo4jGraphStore
+from kg_rag.neo4j_store import Neo4jGraphStore, stable_id
 from kg_rag.pipelines.indexing import IndexingPipeline
 from kg_rag.pipelines.query import QueryPipeline
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+UPLOADS_DIR = Path(tempfile.gettempdir()) / "kg-rag-uploads"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+DOCUMENT_ID_PATTERN = re.compile(r"^[a-f0-9]{16,64}$")
 JOB_TTL_SECONDS = 3600
 JOB_STATUS = Literal["queued", "running", "done", "error"]
 
@@ -45,6 +49,7 @@ class JobState:
     session_id: str
     filename: str
     status: JOB_STATUS
+    document_id: str = ""
     step: str = "queued"
     current: int = 0
     total: int = 0
@@ -54,13 +59,13 @@ class JobState:
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     graph: dict[str, Any] | None = None
-    tmp_dir: Path | None = None
     future: Future | None = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "job_id": self.id,
             "filename": self.filename,
+            "document_id": self.document_id,
             "status": self.status,
             "step": self.step,
             "current": self.current,
@@ -144,6 +149,23 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         session_id = _require_session_id(x_session_id)
         return await _enqueue_upload(file, app_config, session_id)
 
+    @app.get("/api/pdf/{document_id}")
+    def serve_pdf(
+        document_id: str,
+        x_session_id: str | None = Header(default=None),
+    ) -> FileResponse:
+        session_id = _require_session_id(x_session_id)
+        if not DOCUMENT_ID_PATTERN.match(document_id):
+            raise HTTPException(status_code=400, detail="Ungültige Dokument-ID")
+        path = _resolve_pdf_path(session_id, document_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="PDF nicht gefunden")
+        return FileResponse(
+            path,
+            media_type="application/pdf",
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/jobs/{job_id}")
     def job_status(
         job_id: str,
@@ -175,6 +197,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Session-Cleanup fehlgeschlagen: {exc}") from exc
         finally:
             store.close()
+        _cleanup_session_uploads(session_id)
         return {"deleted": session_id}
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -193,9 +216,13 @@ async def _enqueue_upload(file: UploadFile, config: RagConfig, session_id: str) 
         raise HTTPException(status_code=413, detail="Datei zu groß (max. 50 MB)")
 
     safe_name = Path(filename).name or "upload.pdf"
-    tmp_dir = Path(tempfile.mkdtemp(prefix="kg-rag-upload-"))
-    tmp_path = tmp_dir / safe_name
-    tmp_path.write_bytes(contents)
+    session_dir = UPLOADS_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = session_dir / safe_name
+    pdf_path.write_bytes(contents)
+    resolved_source = str(pdf_path.resolve())
+    document_id = stable_id(f"{session_id}|{resolved_source}")
+    _record_pdf_manifest(session_id, document_id, safe_name)
 
     job_id = uuid.uuid4().hex
     estimated = _estimate_seconds(len(contents))
@@ -204,33 +231,33 @@ async def _enqueue_upload(file: UploadFile, config: RagConfig, session_id: str) 
         id=job_id,
         session_id=session_id,
         filename=safe_name,
+        document_id=document_id,
         status="queued",
         step="queued",
         estimated_seconds=estimated,
-        tmp_dir=tmp_dir,
     )
     with JOBS_LOCK:
         _evict_old_jobs(time.time())
         INDEXING_JOBS[job_id] = state
 
-    future = JOB_EXECUTOR.submit(_run_indexing_job, job_id, tmp_path, config)
+    future = JOB_EXECUTOR.submit(_run_indexing_job, job_id, pdf_path, config)
     state.future = future
 
     return {
         "job_id": job_id,
         "filename": safe_name,
+        "document_id": document_id,
         "status": "queued",
         "estimated_seconds": estimated,
     }
 
 
-def _run_indexing_job(job_id: str, tmp_path: Path, config: RagConfig) -> None:
+def _run_indexing_job(job_id: str, pdf_path: Path, config: RagConfig) -> None:
     with JOBS_LOCK:
         state = INDEXING_JOBS.get(job_id)
         if state is None:
             return
         session_id = state.session_id
-        tmp_dir = state.tmp_dir
 
     _update_job(job_id, status="running", step="parsing", current=0, total=0)
 
@@ -240,7 +267,7 @@ def _run_indexing_job(job_id: str, tmp_path: Path, config: RagConfig) -> None:
     pipeline = IndexingPipeline(config)
     try:
         chunk_count = pipeline.run(
-            [tmp_path],
+            [pdf_path],
             session_id=session_id,
             progress=progress,
         )
@@ -269,13 +296,56 @@ def _run_indexing_job(job_id: str, tmp_path: Path, config: RagConfig) -> None:
             pipeline.store.close()
         except Exception:
             logger.exception("Failed to close store for job %s", job_id)
-        if tmp_dir is not None and tmp_dir.exists():
-            try:
-                for child in tmp_dir.iterdir():
-                    child.unlink()
-                tmp_dir.rmdir()
-            except Exception:
-                logger.exception("Failed to clean tmp_dir for job %s", job_id)
+
+
+def _manifest_path(session_id: str) -> Path:
+    return UPLOADS_DIR / session_id / "index.json"
+
+
+def _record_pdf_manifest(session_id: str, document_id: str, filename: str) -> None:
+    path = _manifest_path(session_id)
+    try:
+        manifest: dict[str, str] = json.loads(path.read_text("utf-8")) if path.exists() else {}
+    except Exception:
+        manifest = {}
+    manifest[document_id] = filename
+    try:
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+    except Exception:
+        logger.exception("Failed to write PDF manifest for session %s", session_id)
+
+
+def _resolve_pdf_path(session_id: str, document_id: str) -> Path | None:
+    session_dir = UPLOADS_DIR / session_id
+    if not session_dir.is_dir():
+        return None
+    try:
+        manifest: dict[str, str] = json.loads(_manifest_path(session_id).read_text("utf-8"))
+    except Exception:
+        return None
+    filename = manifest.get(document_id)
+    if not filename:
+        return None
+    if "/" in filename or "\\" in filename or filename.startswith(".."):
+        return None
+    candidate = (session_dir / filename).resolve()
+    try:
+        candidate.relative_to(session_dir.resolve())
+    except ValueError:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def _cleanup_session_uploads(session_id: str) -> None:
+    session_dir = UPLOADS_DIR / session_id
+    if not session_dir.exists():
+        return
+    try:
+        shutil.rmtree(session_dir)
+    except Exception:
+        logger.exception("Failed to clean uploads for session %s", session_id)
 
 
 def _handle_query(request: QueryRequest, config: RagConfig, session_id: str) -> dict[str, Any]:
@@ -303,6 +373,7 @@ def _handle_query(request: QueryRequest, config: RagConfig, session_id: str) -> 
         "vector_chunks": len(result.vector_documents),
         "graph_chunks": len(result.graph_documents),
         "context": result.context,
+        "citations": result.citations,
     }
 
 
@@ -327,7 +398,17 @@ def run(host: str = "127.0.0.1", port: int = 8000) -> None:
 
     config = RagConfig.from_env()
     _reset_graph(config)
+    _reset_uploads()
     uvicorn.run(create_app(config), host=host, port=port)
+
+
+def _reset_uploads() -> None:
+    if not UPLOADS_DIR.exists():
+        return
+    try:
+        shutil.rmtree(UPLOADS_DIR)
+    except Exception:
+        logger.exception("Failed to clean uploads dir on startup")
 
 
 def _warmup_embedder(model: str) -> None:

@@ -7,6 +7,7 @@
   <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
@@ -169,6 +170,109 @@
       font-size: 13px;
     }
 
+    #view-chat.active { display: flex; flex-direction: row; }
+    #pdf-pane {
+      width: 52%;
+      min-width: 320px;
+      border-right: 1px solid #1f232b;
+      display: flex;
+      flex-direction: column;
+      background: #0b0d12;
+    }
+    #pdf-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-bottom: 1px solid #1f232b;
+      font-size: 12px;
+      color: #8b94a3;
+      flex-shrink: 0;
+    }
+    #pdf-toolbar button {
+      background: #161a22;
+      color: #c9cdd6;
+      border: 1px solid #1f232b;
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+    }
+    #pdf-toolbar button:hover:not(:disabled) { background: #1f2533; }
+    #pdf-toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #pdf-title {
+      flex: 1;
+      color: #8b94a3;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #pdf-canvas-wrap {
+      flex: 1;
+      overflow: auto;
+      position: relative;
+      padding: 16px;
+      display: flex;
+      justify-content: center;
+    }
+    #pdf-empty {
+      margin: auto;
+      color: #4a5160;
+      font-size: 13px;
+      text-align: center;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .pdf-page {
+      position: relative;
+      margin: 0 auto;
+      box-shadow: 0 2px 16px rgba(0, 0, 0, 0.4);
+      background: #fff;
+    }
+    .pdf-page canvas { display: block; }
+    .pdf-page .textLayer {
+      position: absolute;
+      left: 0;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      overflow: hidden;
+      opacity: 0.25;
+      line-height: 1.0;
+      color: transparent;
+    }
+    .pdf-page .textLayer > span,
+    .pdf-page .textLayer > br {
+      position: absolute;
+      white-space: pre;
+      cursor: text;
+      transform-origin: 0% 0%;
+    }
+    .pdf-page .textLayer .pdf-highlight {
+      background: rgba(201, 162, 39, 0.55);
+      color: transparent;
+      border-radius: 2px;
+      box-shadow: 0 0 0 2px rgba(201, 162, 39, 0.35);
+    }
+    .cite {
+      display: inline-block;
+      color: #7aa2f7;
+      cursor: pointer;
+      text-decoration: underline;
+      text-decoration-style: dotted;
+      text-decoration-color: #4a5d8a;
+      padding: 0 1px;
+      border-radius: 3px;
+      transition: background 0.12s;
+    }
+    .cite:hover { background: rgba(122, 162, 247, 0.15); }
+    .cite.broken {
+      color: #6b7382;
+      text-decoration-style: dashed;
+      cursor: not-allowed;
+    }
+
     #chat {
       flex-direction: column;
       background: #0f1115;
@@ -323,6 +427,19 @@
       </div>
     </section>
     <section id="view-chat" class="view">
+      <div id="pdf-pane">
+        <div id="pdf-toolbar">
+          <button id="pdf-prev" type="button" disabled>◀</button>
+          <span id="pdf-page-info">– / –</span>
+          <button id="pdf-next" type="button" disabled>▶</button>
+          <span id="pdf-title"></span>
+        </div>
+        <div id="pdf-canvas-wrap">
+          <div id="pdf-empty">
+            Lade eine PDF hoch oder klicke auf eine Quelle wie [S1] in einer Antwort.
+          </div>
+        </div>
+      </div>
       <div id="chat" style="display:flex; flex:1; flex-direction:column; min-width:0;">
         <div id="chat-messages">
           <div id="chat-empty">
@@ -357,6 +474,17 @@
     const chatEmpty = document.getElementById('chat-empty');
     const chatInput = document.getElementById('chat-input');
     const chatSend = document.getElementById('chat-send');
+    const pdfCanvasWrap = document.getElementById('pdf-canvas-wrap');
+    const pdfEmpty = document.getElementById('pdf-empty');
+    const pdfTitleEl = document.getElementById('pdf-title');
+    const pdfPageInfo = document.getElementById('pdf-page-info');
+    const pdfPrevBtn = document.getElementById('pdf-prev');
+    const pdfNextBtn = document.getElementById('pdf-next');
+
+    if (window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+    }
 
     let network = null;
     let chatBusy = false;
@@ -381,6 +509,155 @@
     function sessionHeaders(extra) {
       return Object.assign({ 'X-Session-Id': sessionId }, extra || {});
     }
+
+    const pdfViewer = {
+      doc: null,
+      documentId: null,
+      title: '',
+      currentPage: 1,
+      totalPages: 0,
+      pendingSnippet: null,
+      renderToken: 0,
+      knownDocs: new Map(),
+
+      registerDoc(documentId, title) {
+        if (documentId) this.knownDocs.set(documentId, title || documentId);
+      },
+
+      async open(documentId, page, snippet) {
+        if (!documentId || !window.pdfjsLib) return;
+        const targetPage = Math.max(1, parseInt(page, 10) || 1);
+        this.pendingSnippet = snippet || null;
+        if (documentId === this.documentId && this.doc) {
+          this.currentPage = Math.min(targetPage, this.totalPages || targetPage);
+          await this.renderPage(this.currentPage);
+          return;
+        }
+        try {
+          const url = '/api/pdf/' + encodeURIComponent(documentId);
+          const loadingTask = window.pdfjsLib.getDocument({
+            url,
+            httpHeaders: { 'X-Session-Id': sessionId },
+            withCredentials: false,
+          });
+          const doc = await loadingTask.promise;
+          this.doc = doc;
+          this.documentId = documentId;
+          this.title = this.knownDocs.get(documentId) || documentId;
+          this.totalPages = doc.numPages;
+          this.currentPage = Math.min(targetPage, this.totalPages || targetPage);
+          pdfTitleEl.textContent = this.title;
+          await this.renderPage(this.currentPage);
+        } catch (err) {
+          console.warn('PDF konnte nicht geladen werden:', err);
+          pdfEmpty.textContent = 'PDF konnte nicht geladen werden: ' + (err.message || err);
+          pdfEmpty.style.display = '';
+          pdfCanvasWrap.querySelectorAll('.pdf-page').forEach(el => el.remove());
+        }
+      },
+
+      async renderPage(num) {
+        if (!this.doc) return;
+        const token = ++this.renderToken;
+        this.currentPage = Math.max(1, Math.min(num, this.totalPages));
+        pdfPageInfo.textContent = this.currentPage + ' / ' + this.totalPages;
+        pdfPrevBtn.disabled = this.currentPage <= 1;
+        pdfNextBtn.disabled = this.currentPage >= this.totalPages;
+        pdfEmpty.style.display = 'none';
+
+        const page = await this.doc.getPage(this.currentPage);
+        if (token !== this.renderToken) return;
+
+        const wrapWidth = Math.max(320, pdfCanvasWrap.clientWidth - 32);
+        const viewport0 = page.getViewport({ scale: 1 });
+        const scale = wrapWidth / viewport0.width;
+        const viewport = page.getViewport({ scale });
+
+        pdfCanvasWrap.querySelectorAll('.pdf-page').forEach(el => el.remove());
+        const pageWrap = document.createElement('div');
+        pageWrap.className = 'pdf-page';
+        pageWrap.style.width = viewport.width + 'px';
+        pageWrap.style.height = viewport.height + 'px';
+        const canvas = document.createElement('canvas');
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = viewport.width * dpr;
+        canvas.height = viewport.height * dpr;
+        canvas.style.width = viewport.width + 'px';
+        canvas.style.height = viewport.height + 'px';
+        const ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+        const textLayer = document.createElement('div');
+        textLayer.className = 'textLayer';
+        textLayer.style.width = viewport.width + 'px';
+        textLayer.style.height = viewport.height + 'px';
+        pageWrap.append(canvas, textLayer);
+        pdfCanvasWrap.appendChild(pageWrap);
+
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        if (token !== this.renderToken) return;
+
+        const textContent = await page.getTextContent();
+        if (token !== this.renderToken) return;
+        window.pdfjsLib.renderTextLayer({
+          textContent,
+          container: textLayer,
+          viewport,
+          textDivs: [],
+        });
+
+        if (this.pendingSnippet) {
+          // Small delay to let text spans settle into the DOM.
+          setTimeout(() => {
+            if (token === this.renderToken) this.highlight(textLayer, this.pendingSnippet);
+          }, 50);
+        }
+      },
+
+      highlight(textLayer, snippet) {
+        const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const target = norm(snippet);
+        if (!target) return;
+        const words = target.split(' ').filter(Boolean).slice(0, 6).join(' ');
+        if (words.length < 4) return;
+        const spans = Array.from(textLayer.querySelectorAll('span'));
+        if (!spans.length) return;
+        let combined = '';
+        const ranges = [];
+        for (const span of spans) {
+          const text = norm(span.textContent);
+          if (!text) continue;
+          const start = combined.length ? combined.length + 1 : 0;
+          combined = combined ? combined + ' ' + text : text;
+          ranges.push({ span, start, end: combined.length });
+        }
+        const matchIndex = combined.indexOf(words);
+        if (matchIndex < 0) return;
+        const matchEnd = matchIndex + words.length;
+        let firstHit = null;
+        for (const r of ranges) {
+          if (r.end <= matchIndex) continue;
+          if (r.start >= matchEnd) break;
+          r.span.classList.add('pdf-highlight');
+          if (!firstHit) firstHit = r.span;
+        }
+        if (firstHit) {
+          firstHit.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+      },
+    };
+
+    pdfPrevBtn.addEventListener('click', () => {
+      if (pdfViewer.doc && pdfViewer.currentPage > 1) {
+        pdfViewer.pendingSnippet = null;
+        pdfViewer.renderPage(pdfViewer.currentPage - 1);
+      }
+    });
+    pdfNextBtn.addEventListener('click', () => {
+      if (pdfViewer.doc && pdfViewer.currentPage < pdfViewer.totalPages) {
+        pdfViewer.pendingSnippet = null;
+        pdfViewer.renderPage(pdfViewer.currentPage + 1);
+      }
+    });
 
     function setStatus(text, kind) {
       statusEl.textContent = text;
@@ -566,6 +843,7 @@
         setStatus(`Fehler: ${err.message}`, 'error');
         return;
       }
+      if (job.document_id) pdfViewer.registerDoc(job.document_id, job.filename);
       pollJob(job.job_id, job.filename, job.estimated_seconds || 120);
     }
 
@@ -605,6 +883,10 @@
             dropArea.classList.remove('busy');
             addFileEntry(filename, `${data.chunks_indexed} Chunks`, true);
             if (data.graph) renderGraph(data.graph);
+            if (data.document_id) {
+              pdfViewer.registerDoc(data.document_id, filename);
+              pdfViewer.open(data.document_id, 1, null);
+            }
             setStatus(data.graph ? graphSummary(data.graph) : 'Fertig');
           } else if (data.status === 'error') {
             clearInterval(activePoll);
@@ -635,6 +917,8 @@
         const body = document.createElement('div');
         body.className = 'msg-body';
         body.innerHTML = DOMPurify.sanitize(marked.parse(text || ''));
+        const citations = Array.isArray(options.citations) ? options.citations : [];
+        decorateCitations(body, citations);
         msg.appendChild(body);
       } else {
         msg.textContent = text;
@@ -654,6 +938,66 @@
       chatMessages.scrollTop = chatMessages.scrollHeight;
       return msg;
     }
+
+    function decorateCitations(body, citations) {
+      if (!citations.length) return;
+      const byIndex = new Map();
+      citations.forEach(c => {
+        if (c && typeof c.index === 'number') {
+          byIndex.set(c.index, c);
+          pdfViewer.registerDoc(c.document_id, c.title);
+        }
+      });
+      if (!byIndex.size) return;
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, null);
+      const textNodes = [];
+      let node;
+      while ((node = walker.nextNode())) {
+        if (/\[S\d+\]/.test(node.nodeValue)) textNodes.push(node);
+      }
+      textNodes.forEach(textNode => {
+        const parent = textNode.parentNode;
+        if (!parent) return;
+        const parts = textNode.nodeValue.split(/(\[S\d+\])/g);
+        const frag = document.createDocumentFragment();
+        parts.forEach(part => {
+          const match = part.match(/^\[S(\d+)\]$/);
+          if (!match) {
+            frag.appendChild(document.createTextNode(part));
+            return;
+          }
+          const idx = parseInt(match[1], 10);
+          const cite = byIndex.get(idx);
+          const a = document.createElement('a');
+          a.className = 'cite';
+          a.href = '#';
+          a.dataset.index = String(idx);
+          a.textContent = part;
+          if (cite && cite.document_id) {
+            a.dataset.documentId = cite.document_id;
+            a.dataset.page = String(cite.page_number || 1);
+            if (cite.snippet) a.dataset.snippet = cite.snippet;
+            if (cite.title) a.title = cite.title + ' · Seite ' + (cite.page_number || 1);
+          } else {
+            a.classList.add('broken');
+            a.title = 'Quelle nicht verfügbar';
+          }
+          frag.appendChild(a);
+        });
+        parent.replaceChild(frag, textNode);
+      });
+    }
+
+    chatMessages.addEventListener('click', e => {
+      const a = e.target.closest('a.cite');
+      if (!a) return;
+      e.preventDefault();
+      if (a.classList.contains('broken')) return;
+      const documentId = a.dataset.documentId;
+      if (!documentId) return;
+      const page = parseInt(a.dataset.page || '1', 10);
+      pdfViewer.open(documentId, page, a.dataset.snippet || null);
+    });
 
     function setChatBusy(busy) {
       chatBusy = busy;
@@ -695,7 +1039,10 @@
         if (Array.isArray(data.query_entities) && data.query_entities.length) {
           meta.push(['Entitäten', data.query_entities.join(', ')]);
         }
-        appendMessage('assistant', data.answer || '(leere Antwort)', { meta });
+        appendMessage('assistant', data.answer || '(leere Antwort)', {
+          meta,
+          citations: data.citations || [],
+        });
         setStatus('Antwort geliefert');
       } catch (err) {
         pending.remove();
