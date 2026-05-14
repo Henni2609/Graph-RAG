@@ -149,22 +149,23 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         session_id = _require_session_id(x_session_id)
         return await _enqueue_upload(file, app_config, session_id)
 
-    @app.get("/api/pdf/{document_id}")
-    def serve_pdf(
+    @app.get("/api/document/{document_id}/text")
+    def document_text(
         document_id: str,
         x_session_id: str | None = Header(default=None),
-    ) -> FileResponse:
+    ) -> dict[str, Any]:
         session_id = _require_session_id(x_session_id)
         if not DOCUMENT_ID_PATTERN.match(document_id):
             raise HTTPException(status_code=400, detail="Ungültige Dokument-ID")
-        path = _resolve_pdf_path(session_id, document_id)
+        path = _resolve_pdf_file(session_id, document_id)
         if path is None:
-            raise HTTPException(status_code=404, detail="PDF nicht gefunden")
-        return FileResponse(
-            path,
-            media_type="application/pdf",
-            headers={"Cache-Control": "no-store"},
-        )
+            raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
+        try:
+            pages = _extract_pdf_pages(path)
+        except Exception as exc:
+            logger.exception("PDF-Textextraktion fehlgeschlagen für %s", path)
+            raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
+        return {"document_id": document_id, "title": path.name, "pages": pages}
 
     @app.get("/api/jobs/{job_id}")
     def job_status(
@@ -315,7 +316,7 @@ def _record_pdf_manifest(session_id: str, document_id: str, filename: str) -> No
         logger.exception("Failed to write PDF manifest for session %s", session_id)
 
 
-def _resolve_pdf_path(session_id: str, document_id: str) -> Path | None:
+def _resolve_pdf_file(session_id: str, document_id: str) -> Path | None:
     session_dir = UPLOADS_DIR / session_id
     if not session_dir.is_dir():
         return None
@@ -338,6 +339,18 @@ def _resolve_pdf_path(session_id: str, document_id: str) -> Path | None:
     return candidate
 
 
+def _extract_pdf_pages(path: Path) -> list[dict[str, Any]]:
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    pages: list[dict[str, Any]] = []
+    for idx, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            pages.append({"page_number": idx, "text": text})
+    return pages
+
+
 def _cleanup_session_uploads(session_id: str) -> None:
     session_dir = UPLOADS_DIR / session_id
     if not session_dir.exists():
@@ -348,11 +361,31 @@ def _cleanup_session_uploads(session_id: str) -> None:
         logger.exception("Failed to clean uploads for session %s", session_id)
 
 
+def _purge_orphan_chunks(config: RagConfig, session_id: str) -> None:
+    manifest_path = _manifest_path(session_id)
+    if not manifest_path.exists():
+        return
+    try:
+        manifest: dict[str, str] = json.loads(manifest_path.read_text("utf-8"))
+    except Exception:
+        return
+    if not manifest:
+        return
+    store = Neo4jGraphStore(config.neo4j)
+    try:
+        store.delete_orphan_chunks(session_id, set(manifest.keys()))
+    except Exception:
+        logger.exception("Orphan-chunk cleanup failed for session %s", session_id)
+    finally:
+        store.close()
+
+
 def _handle_query(request: QueryRequest, config: RagConfig, session_id: str) -> dict[str, Any]:
     question = request.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Frage darf nicht leer sein")
 
+    _purge_orphan_chunks(config, session_id)
     pipeline = QueryPipeline(config)
     try:
         result = pipeline.run(
@@ -397,8 +430,6 @@ def run(host: str = "127.0.0.1", port: int = 8000) -> None:
     import uvicorn
 
     config = RagConfig.from_env()
-    _reset_graph(config)
-    _reset_uploads()
     uvicorn.run(create_app(config), host=host, port=port)
 
 

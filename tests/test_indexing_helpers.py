@@ -29,11 +29,11 @@ def test_fallback_sentence_split_uses_overlap() -> None:
 
 
 def test_normalize_chunk_metadata_adds_stable_ids() -> None:
-    chunk = make_document("Content", meta={"source": "/tmp/doc.md", "split_idx": 3})
+    chunk = make_document("Content", meta={"source": "/tmp/doc.md"})
 
     normalized = normalize_chunk_metadata([chunk])[0]
 
     assert normalized.meta["document_id"]
     assert normalized.meta["chunk_id"]
-    assert normalized.meta["chunk_index"] == 3
+    assert normalized.meta["chunk_index"] == 0
     assert normalized.meta["title"] == "doc.md"

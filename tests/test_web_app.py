@@ -159,6 +159,7 @@ class FakeQueryPipeline:
             ],
             entity_context="A --rel--> B",
             query_entities=["Haystack", "Neo4j"],
+            citations=[],
         )
 
 
@@ -434,3 +435,41 @@ def test_session_end_deletes_session(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {"deleted": TEST_SESSION_ID}
     assert deleted_ids == [TEST_SESSION_ID]
+
+
+def test_document_text_endpoint_returns_pages(monkeypatch, tmp_path) -> None:
+    pdf_path = tmp_path / "doc.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    monkeypatch.setattr(
+        "kg_rag.web.app._resolve_pdf_file",
+        lambda session_id, document_id: pdf_path,
+    )
+    monkeypatch.setattr(
+        "kg_rag.web.app._extract_pdf_pages",
+        lambda path: [{"page_number": 1, "text": "Seite eins"}, {"page_number": 2, "text": "Seite zwei"}],
+    )
+
+    client = TestClient(create_app(_build_config()))
+    response = client.get(
+        "/api/document/abcdef1234567890abcdef1234567890/text",
+        headers=SESSION_HEADERS,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["pages"]) == 2
+    assert body["pages"][0]["page_number"] == 1
+    assert body["pages"][1]["text"] == "Seite zwei"
+
+
+def test_document_text_endpoint_returns_404_for_unknown(monkeypatch) -> None:
+    monkeypatch.setattr("kg_rag.web.app._resolve_pdf_file", lambda *_: None)
+
+    client = TestClient(create_app(_build_config()))
+    response = client.get(
+        "/api/document/abcdef1234567890abcdef1234567890/text",
+        headers=SESSION_HEADERS,
+    )
+
+    assert response.status_code == 404

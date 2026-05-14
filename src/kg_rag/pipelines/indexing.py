@@ -149,8 +149,8 @@ def normalize_chunk_metadata(
         meta = document_meta(chunk)
         source = str(meta.get("source") or meta.get("file_path") or meta.get("path") or "unknown")
         document_id = str(meta.get("document_id") or stable_id(f"{session_id}|{source}"))
-        chunk_index = int(meta.get("chunk_index", meta.get("split_idx", counters[document_id])) or 0)
-        counters[document_id] = max(counters[document_id], chunk_index + 1)
+        chunk_index = int(meta.get("chunk_index", counters[document_id]) or 0)
+        counters[document_id] = chunk_index + 1
         page_number = meta.get("page_number")
         try:
             page_number = int(page_number) if page_number is not None else 1
@@ -232,10 +232,10 @@ def _load_pdf_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_
 
         converter = PyPDFToDocument()
         result = converter.run(sources=files)
-        documents = result["documents"]
-        for index, document in enumerate(documents):
-            source = _converted_source(document, files, index)
-            _attach_source_metadata(document, source, session_id=session_id)
+        documents: list[Document] = []
+        for index, raw_doc in enumerate(result["documents"]):
+            source = str(files[index]) if index < len(files) else _converted_source(raw_doc, files, index)
+            documents.extend(_split_into_pages(document_content(raw_doc), source, session_id))
         return documents
     except Exception as exc:
         logger.warning(f"Haystack PDF converter unavailable, using fallback loader: {exc}")
@@ -244,9 +244,26 @@ def _load_pdf_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_
         documents = []
         for path in files:
             reader = PdfReader(str(path))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            documents.append(make_document(text, meta=_source_metadata(path, session_id=session_id)))
+            for page_idx, page in enumerate(reader.pages, start=1):
+                text = page.extract_text() or ""
+                if not text.strip():
+                    continue
+                documents.append(make_document(
+                    text,
+                    meta={**_source_metadata(path, session_id=session_id), "page_number": page_idx},
+                ))
         return documents
+
+
+def _split_into_pages(content: str, source: str, session_id: str) -> list[Document]:
+    base_meta = _source_metadata(Path(source), session_id=session_id)
+    documents: list[Document] = []
+    for page_idx, page_text in enumerate(content.split("\x0c"), start=1):
+        page_text = page_text.strip()
+        if not page_text:
+            continue
+        documents.append(make_document(page_text, meta={**base_meta, "page_number": page_idx}))
+    return documents
 
 
 def _attach_source_metadata(document: Document, source: str, *, session_id: str) -> None:
@@ -256,12 +273,14 @@ def _attach_source_metadata(document: Document, source: str, *, session_id: str)
 
 
 def _converted_source(document: Document, files: list[Path], index: int) -> str:
+    # Prefer the resolved input path we control; Haystack converters may
+    # store only the basename in file_path, which would resolve against CWD.
+    if index < len(files):
+        return str(files[index])
     meta = document_meta(document)
     for key in ("source", "file_path", "path"):
         if meta.get(key):
             return str(meta[key])
-    if index < len(files):
-        return str(files[index])
     return "unknown"
 
 

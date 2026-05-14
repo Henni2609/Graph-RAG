@@ -20,8 +20,10 @@ Struktur der Antwort:
 1. Beginne mit Saetzen, die das Konzept klar definieren: was es ist und wozu es dient.
 2. Danach optional Stichpunkte oder kurze Absaetze mit relevanten Details.
 
-Zitiere Quellen kompakt im Format (Dateiname, Abschnitt N) oder mit den Kurz-Tags [S1], [S2],
-die im Kontext angegeben sind. Verwende niemals chunk_id-Hashes oder lange Hex-Strings.
+Zitiere Quellen ausschliesslich mit den Kurz-Tags [S1], [S2] usw., die am Anfang jedes
+Kontextabschnitts stehen. Schreibe niemals (Dateiname, ...) oder Hex-Strings als Quellenangabe.
+Zitiere jede Quelle als eigenen Tag, also [S1] [S3]. Niemals [S1, S3] oder [S1,S3].
+Erfinde keine Tag-Nummern jenseits der vorhandenen Kontextabschnitte.
 
 Nutze Markdown sparsam fuer Fett (**...**) und Listen (-). Vermeide Codebloecke, ueberlange
 Antworten und ausschweifende Wiederholungen."""
@@ -101,6 +103,7 @@ class QueryPipeline:
         context = merge_result["merged_context"]
         citations = merge_result.get("citations", [])
         answer = self.generate_answer(question, context, generator=generator)
+        answer = sanitize_citations(answer, {c["index"] for c in citations})
 
         return QueryResult(
             answer=answer,
@@ -121,7 +124,7 @@ class QueryPipeline:
                 generation_kwargs={
                     "temperature": 0,
                     "max_tokens": 200,
-                    "timeout": 4,
+                    "timeout": 15,
                     "extra_body": {"thinking": {"type": "disabled"}},
                 },
             )
@@ -152,6 +155,15 @@ class QueryPipeline:
                 max_retries=0,
             )
         return self.generator
+
+
+def sanitize_citations(answer: str, valid_indexes: set[int]) -> str:
+    import re
+    def _replace(m: re.Match) -> str:
+        idx = int(m.group(1))
+        return "" if idx not in valid_indexes else m.group(0)
+    result = re.sub(r"\[S(\d+)\]", _replace, answer)
+    return re.sub(r"  +", " ", result)
 
 
 def embed_query(question: str, *, model: str) -> list[float]:

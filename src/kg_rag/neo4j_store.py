@@ -61,6 +61,31 @@ class Neo4jGraphStore:
             session_id=session_id,
         )
 
+    def delete_orphan_chunks(self, session_id: str, valid_document_ids: set[str]) -> None:
+        if not session_id or not valid_document_ids:
+            return
+        valid_ids = list(valid_document_ids)
+        self.execute_write(
+            "MATCH (c:Chunk {session_id: $session_id}) "
+            "WHERE NOT c.document_id IN $valid_ids "
+            "DETACH DELETE c",
+            session_id=session_id,
+            valid_ids=valid_ids,
+        )
+        self.execute_write(
+            "MATCH (d:Document {session_id: $session_id}) "
+            "WHERE NOT d.id IN $valid_ids "
+            "DETACH DELETE d",
+            session_id=session_id,
+            valid_ids=valid_ids,
+        )
+        self.execute_write(
+            "MATCH (e:Entity {session_id: $session_id}) "
+            "WHERE NOT (e)<-[:MENTIONS]-(:Chunk) "
+            "DETACH DELETE e",
+            session_id=session_id,
+        )
+
     def setup_schema(self) -> None:
         statements = [
             "DROP CONSTRAINT entity_name_normalized IF EXISTS",

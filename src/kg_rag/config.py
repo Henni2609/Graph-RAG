@@ -67,7 +67,7 @@ class RagConfig:
     max_context_chars: int = 6000
     entity_max_tokens: int = 800
     answer_max_tokens: int = 500
-    answer_timeout_seconds: int = 11
+    answer_timeout_seconds: int = 60
     extraction_concurrency: int = 10
 
     @classmethod
@@ -84,6 +84,6 @@ class RagConfig:
             max_context_chars=_get_int("MAX_CONTEXT_CHARS", 6000),
             entity_max_tokens=_get_int("ENTITY_MAX_TOKENS", 800),
             answer_max_tokens=_get_int("ANSWER_MAX_TOKENS", 500),
-            answer_timeout_seconds=_get_int("ANSWER_TIMEOUT_SECONDS", 11),
+            answer_timeout_seconds=_get_int("ANSWER_TIMEOUT_SECONDS", 60),
             extraction_concurrency=_get_int("EXTRACTION_CONCURRENCY", 10),
         )

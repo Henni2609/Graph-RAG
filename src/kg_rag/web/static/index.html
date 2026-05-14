@@ -7,7 +7,6 @@
   <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
@@ -171,7 +170,7 @@
     }
 
     #view-chat.active { display: flex; flex-direction: row; }
-    #pdf-pane {
+    #doc-pane {
       width: 52%;
       min-width: 320px;
       border-right: 1px solid #1f232b;
@@ -179,7 +178,7 @@
       flex-direction: column;
       background: #0b0d12;
     }
-    #pdf-toolbar {
+    #doc-toolbar {
       display: flex;
       align-items: center;
       gap: 10px;
@@ -189,87 +188,67 @@
       color: #8b94a3;
       flex-shrink: 0;
     }
-    #pdf-toolbar button {
-      background: #161a22;
-      color: #c9cdd6;
-      border: 1px solid #1f232b;
-      border-radius: 6px;
-      padding: 4px 10px;
-      cursor: pointer;
-      font-family: inherit;
-      font-size: 12px;
-    }
-    #pdf-toolbar button:hover:not(:disabled) { background: #1f2533; }
-    #pdf-toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
-    #pdf-title {
+    #doc-title {
       flex: 1;
       color: #8b94a3;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    #pdf-canvas-wrap {
+    #doc-text-wrap {
       flex: 1;
-      overflow: auto;
-      position: relative;
-      padding: 16px;
-      display: flex;
-      justify-content: center;
+      overflow-y: auto;
+      padding: 24px 28px;
     }
-    #pdf-empty {
-      margin: auto;
+    #doc-empty {
       color: #4a5160;
       font-size: 13px;
       text-align: center;
       padding: 24px;
       line-height: 1.5;
     }
-    .pdf-page {
-      position: relative;
+    #doc-text {
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 14px;
+      line-height: 1.65;
+      color: #d0d4dc;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      max-width: 720px;
       margin: 0 auto;
-      box-shadow: 0 2px 16px rgba(0, 0, 0, 0.4);
-      background: #fff;
     }
-    .pdf-page canvas { display: block; }
-    .pdf-page .textLayer {
-      position: absolute;
-      left: 0;
-      top: 0;
-      right: 0;
-      bottom: 0;
-      overflow: hidden;
-      opacity: 0.25;
-      line-height: 1.0;
-      color: transparent;
+    .doc-page-marker {
+      text-align: center;
+      color: #4a5160;
+      font-size: 11px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      letter-spacing: 0.5px;
+      margin: 28px 0 16px;
+      border-top: 1px solid #1f232b;
+      padding-top: 16px;
     }
-    .pdf-page .textLayer > span,
-    .pdf-page .textLayer > br {
-      position: absolute;
-      white-space: pre;
-      cursor: text;
-      transform-origin: 0% 0%;
-    }
-    .pdf-page .textLayer .pdf-highlight {
-      background: rgba(201, 162, 39, 0.55);
-      color: transparent;
+    .doc-page-marker:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+    .doc-page-text { margin-bottom: 8px; }
+    mark.doc-highlight {
+      background: rgba(201, 162, 39, 0.45);
+      color: inherit;
       border-radius: 2px;
-      box-shadow: 0 0 0 2px rgba(201, 162, 39, 0.35);
+      box-shadow: 0 0 0 1px rgba(201, 162, 39, 0.35);
     }
     .cite {
-      display: inline-block;
+      display: inline;
       color: #7aa2f7;
       cursor: pointer;
-      text-decoration: underline;
-      text-decoration-style: dotted;
-      text-decoration-color: #4a5d8a;
+      font-style: italic;
+      text-decoration: none;
       padding: 0 1px;
       border-radius: 3px;
       transition: background 0.12s;
     }
-    .cite:hover { background: rgba(122, 162, 247, 0.15); }
+    .cite:hover { background: rgba(122, 162, 247, 0.15); text-decoration: underline; }
     .cite.broken {
       color: #6b7382;
-      text-decoration-style: dashed;
+      font-style: italic;
       cursor: not-allowed;
     }
 
@@ -427,17 +406,15 @@
       </div>
     </section>
     <section id="view-chat" class="view">
-      <div id="pdf-pane">
-        <div id="pdf-toolbar">
-          <button id="pdf-prev" type="button" disabled>◀</button>
-          <span id="pdf-page-info">– / –</span>
-          <button id="pdf-next" type="button" disabled>▶</button>
-          <span id="pdf-title"></span>
+      <div id="doc-pane">
+        <div id="doc-toolbar">
+          <span id="doc-title">Quelle</span>
         </div>
-        <div id="pdf-canvas-wrap">
-          <div id="pdf-empty">
-            Lade eine PDF hoch oder klicke auf eine Quelle wie [S1] in einer Antwort.
+        <div id="doc-text-wrap">
+          <div id="doc-empty">
+            Klicke auf eine Quelle wie [S1] in einer Antwort, um den passenden Abschnitt zu sehen.
           </div>
+          <article id="doc-text" hidden></article>
         </div>
       </div>
       <div id="chat" style="display:flex; flex:1; flex-direction:column; min-width:0;">
@@ -474,17 +451,9 @@
     const chatEmpty = document.getElementById('chat-empty');
     const chatInput = document.getElementById('chat-input');
     const chatSend = document.getElementById('chat-send');
-    const pdfCanvasWrap = document.getElementById('pdf-canvas-wrap');
-    const pdfEmpty = document.getElementById('pdf-empty');
-    const pdfTitleEl = document.getElementById('pdf-title');
-    const pdfPageInfo = document.getElementById('pdf-page-info');
-    const pdfPrevBtn = document.getElementById('pdf-prev');
-    const pdfNextBtn = document.getElementById('pdf-next');
-
-    if (window.pdfjsLib) {
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-        'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
-    }
+    const docEmpty = document.getElementById('doc-empty');
+    const docTextEl = document.getElementById('doc-text');
+    const docTitleEl = document.getElementById('doc-title');
 
     let network = null;
     let chatBusy = false;
@@ -510,14 +479,9 @@
       return Object.assign({ 'X-Session-Id': sessionId }, extra || {});
     }
 
-    const pdfViewer = {
-      doc: null,
+    const textViewer = {
       documentId: null,
-      title: '',
-      currentPage: 1,
-      totalPages: 0,
-      pendingSnippet: null,
-      renderToken: 0,
+      pagesByNumber: new Map(),
       knownDocs: new Map(),
 
       registerDoc(documentId, title) {
@@ -525,139 +489,137 @@
       },
 
       async open(documentId, page, snippet) {
-        if (!documentId || !window.pdfjsLib) return;
-        const targetPage = Math.max(1, parseInt(page, 10) || 1);
-        this.pendingSnippet = snippet || null;
-        if (documentId === this.documentId && this.doc) {
-          this.currentPage = Math.min(targetPage, this.totalPages || targetPage);
-          await this.renderPage(this.currentPage);
-          return;
+        if (!documentId) return;
+        if (documentId !== this.documentId) {
+          const ok = await this.load(documentId);
+          if (!ok) return;
         }
+        const pageNum = parseInt(page, 10) || 1;
+        this.scrollToPage(pageNum);
+        if (snippet) {
+          setTimeout(() => this.highlight(snippet, pageNum), 120);
+        }
+      },
+
+      async load(documentId) {
+        docEmpty.textContent = 'Lädt …';
+        docEmpty.hidden = false;
+        docTextEl.hidden = true;
         try {
-          const url = '/api/pdf/' + encodeURIComponent(documentId);
-          const loadingTask = window.pdfjsLib.getDocument({
-            url,
-            httpHeaders: { 'X-Session-Id': sessionId },
-            withCredentials: false,
-          });
-          const doc = await loadingTask.promise;
-          this.doc = doc;
+          const res = await fetch(
+            '/api/document/' + encodeURIComponent(documentId) + '/text',
+            { headers: sessionHeaders() }
+          );
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
           this.documentId = documentId;
-          this.title = this.knownDocs.get(documentId) || documentId;
-          this.totalPages = doc.numPages;
-          this.currentPage = Math.min(targetPage, this.totalPages || targetPage);
-          pdfTitleEl.textContent = this.title;
-          await this.renderPage(this.currentPage);
+          docTitleEl.textContent = this.knownDocs.get(documentId) || data.title || documentId;
+          this.render(data.pages || []);
+          return true;
         } catch (err) {
-          console.warn('PDF konnte nicht geladen werden:', err);
-          pdfEmpty.textContent = 'PDF konnte nicht geladen werden: ' + (err.message || err);
-          pdfEmpty.style.display = '';
-          pdfCanvasWrap.querySelectorAll('.pdf-page').forEach(el => el.remove());
+          console.warn('Dokument-Text konnte nicht geladen werden:', err);
+          docEmpty.textContent = 'Text konnte nicht geladen werden.';
+          docEmpty.hidden = false;
+          docTextEl.hidden = true;
+          return false;
         }
       },
 
-      async renderPage(num) {
-        if (!this.doc) return;
-        const token = ++this.renderToken;
-        this.currentPage = Math.max(1, Math.min(num, this.totalPages));
-        pdfPageInfo.textContent = this.currentPage + ' / ' + this.totalPages;
-        pdfPrevBtn.disabled = this.currentPage <= 1;
-        pdfNextBtn.disabled = this.currentPage >= this.totalPages;
-        pdfEmpty.style.display = 'none';
+      render(pages) {
+        docTextEl.replaceChildren();
+        this.pagesByNumber.clear();
+        for (const p of pages) {
+          const marker = document.createElement('div');
+          marker.className = 'doc-page-marker';
+          marker.textContent = '— Seite ' + p.page_number + ' —';
+          const section = document.createElement('section');
+          section.className = 'doc-page-text';
+          section.dataset.pageNumber = String(p.page_number);
+          section.textContent = p.text;
+          docTextEl.append(marker, section);
+          this.pagesByNumber.set(p.page_number, section);
+        }
+        docEmpty.hidden = true;
+        docTextEl.hidden = false;
+      },
 
-        const page = await this.doc.getPage(this.currentPage);
-        if (token !== this.renderToken) return;
+      scrollToPage(page) {
+        const section = this.pagesByNumber.get(page);
+        if (section) section.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      },
 
-        const wrapWidth = Math.max(320, pdfCanvasWrap.clientWidth - 32);
-        const viewport0 = page.getViewport({ scale: 1 });
-        const scale = wrapWidth / viewport0.width;
-        const viewport = page.getViewport({ scale });
-
-        pdfCanvasWrap.querySelectorAll('.pdf-page').forEach(el => el.remove());
-        const pageWrap = document.createElement('div');
-        pageWrap.className = 'pdf-page';
-        pageWrap.style.width = viewport.width + 'px';
-        pageWrap.style.height = viewport.height + 'px';
-        const canvas = document.createElement('canvas');
-        const dpr = window.devicePixelRatio || 1;
-        canvas.width = viewport.width * dpr;
-        canvas.height = viewport.height * dpr;
-        canvas.style.width = viewport.width + 'px';
-        canvas.style.height = viewport.height + 'px';
-        const ctx = canvas.getContext('2d');
-        ctx.scale(dpr, dpr);
-        const textLayer = document.createElement('div');
-        textLayer.className = 'textLayer';
-        textLayer.style.width = viewport.width + 'px';
-        textLayer.style.height = viewport.height + 'px';
-        pageWrap.append(canvas, textLayer);
-        pdfCanvasWrap.appendChild(pageWrap);
-
-        await page.render({ canvasContext: ctx, viewport }).promise;
-        if (token !== this.renderToken) return;
-
-        const textContent = await page.getTextContent();
-        if (token !== this.renderToken) return;
-        window.pdfjsLib.renderTextLayer({
-          textContent,
-          container: textLayer,
-          viewport,
-          textDivs: [],
+      highlight(snippet, page) {
+        docTextEl.querySelectorAll('mark.doc-highlight').forEach(mark => {
+          const parent = mark.parentNode;
+          while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+          parent.removeChild(mark);
+          parent.normalize();
         });
-
-        if (this.pendingSnippet) {
-          // Small delay to let text spans settle into the DOM.
-          setTimeout(() => {
-            if (token === this.renderToken) this.highlight(textLayer, this.pendingSnippet);
-          }, 50);
+        const needle = snippet.toLowerCase().replace(/\s+/g, ' ').trim();
+        if (needle.length < 4) return;
+        const targetPage = parseInt(page, 10) || 1;
+        const pageOrder = [targetPage, ...this.pagesByNumber.keys()]
+          .filter((v, i, a) => v && a.indexOf(v) === i);
+        const variants = [
+          needle,
+          needle.split(' ').slice(0, 12).join(' '),
+          needle.split(' ').slice(0, 6).join(' '),
+        ].filter(v => v.length >= 4);
+        for (const num of pageOrder) {
+          const section = this.pagesByNumber.get(num);
+          if (!section) continue;
+          for (const v of variants) {
+            if (this._markInSection(section, v)) return;
+          }
         }
       },
 
-      highlight(textLayer, snippet) {
-        const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        const target = norm(snippet);
-        if (!target) return;
-        const words = target.split(' ').filter(Boolean).slice(0, 6).join(' ');
-        if (words.length < 4) return;
-        const spans = Array.from(textLayer.querySelectorAll('span'));
-        if (!spans.length) return;
-        let combined = '';
-        const ranges = [];
-        for (const span of spans) {
-          const text = norm(span.textContent);
-          if (!text) continue;
-          const start = combined.length ? combined.length + 1 : 0;
-          combined = combined ? combined + ' ' + text : text;
-          ranges.push({ span, start, end: combined.length });
+      _markInSection(section, needle) {
+        const textNode = section.firstChild;
+        if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return false;
+        const raw = textNode.nodeValue;
+        // Try direct case-insensitive match first
+        let origStart = raw.toLowerCase().indexOf(needle);
+        let origEnd = origStart >= 0 ? origStart + needle.length : -1;
+        // Fall back to normalized (whitespace-collapsed) match
+        if (origStart < 0) {
+          const normHaystack = raw.toLowerCase().replace(/\s+/g, ' ');
+          const normIdx = normHaystack.indexOf(needle);
+          if (normIdx < 0) return false;
+          [origStart, origEnd] = this._normToOrigRange(raw, normIdx, normIdx + needle.length);
         }
-        const matchIndex = combined.indexOf(words);
-        if (matchIndex < 0) return;
-        const matchEnd = matchIndex + words.length;
-        let firstHit = null;
-        for (const r of ranges) {
-          if (r.end <= matchIndex) continue;
-          if (r.start >= matchEnd) break;
-          r.span.classList.add('pdf-highlight');
-          if (!firstHit) firstHit = r.span;
+        if (origStart < 0 || origEnd <= origStart || origEnd > raw.length) return false;
+        const range = document.createRange();
+        range.setStart(textNode, origStart);
+        range.setEnd(textNode, origEnd);
+        const mark = document.createElement('mark');
+        mark.className = 'doc-highlight';
+        try {
+          range.surroundContents(mark);
+          mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          return true;
+        } catch (_) {
+          return false;
         }
-        if (firstHit) {
-          firstHit.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      },
+
+      _normToOrigRange(original, normStart, normEnd) {
+        // Build a map: normToOrig[normPos] = origPos for each non-redundant character
+        const normToOrig = [];
+        let inSpaceRun = false;
+        for (let i = 0; i < original.length; i++) {
+          const isSpace = /\s/.test(original[i]);
+          if (isSpace) {
+            if (!inSpaceRun) { normToOrig.push(i); inSpaceRun = true; }
+          } else {
+            normToOrig.push(i); inSpaceRun = false;
+          }
         }
+        const origStart = normToOrig[normStart] ?? -1;
+        const lastOrig = normToOrig[normEnd - 1] ?? -1;
+        return [origStart, lastOrig >= 0 ? lastOrig + 1 : -1];
       },
     };
-
-    pdfPrevBtn.addEventListener('click', () => {
-      if (pdfViewer.doc && pdfViewer.currentPage > 1) {
-        pdfViewer.pendingSnippet = null;
-        pdfViewer.renderPage(pdfViewer.currentPage - 1);
-      }
-    });
-    pdfNextBtn.addEventListener('click', () => {
-      if (pdfViewer.doc && pdfViewer.currentPage < pdfViewer.totalPages) {
-        pdfViewer.pendingSnippet = null;
-        pdfViewer.renderPage(pdfViewer.currentPage + 1);
-      }
-    });
 
     function setStatus(text, kind) {
       statusEl.textContent = text;
@@ -843,7 +805,7 @@
         setStatus(`Fehler: ${err.message}`, 'error');
         return;
       }
-      if (job.document_id) pdfViewer.registerDoc(job.document_id, job.filename);
+      if (job.document_id) textViewer.registerDoc(job.document_id, job.filename);
       pollJob(job.job_id, job.filename, job.estimated_seconds || 120);
     }
 
@@ -883,10 +845,7 @@
             dropArea.classList.remove('busy');
             addFileEntry(filename, `${data.chunks_indexed} Chunks`, true);
             if (data.graph) renderGraph(data.graph);
-            if (data.document_id) {
-              pdfViewer.registerDoc(data.document_id, filename);
-              pdfViewer.open(data.document_id, 1, null);
-            }
+            if (data.document_id) textViewer.registerDoc(data.document_id, filename);
             setStatus(data.graph ? graphSummary(data.graph) : 'Fertig');
           } else if (data.status === 'error') {
             clearInterval(activePoll);
@@ -945,7 +904,7 @@
       citations.forEach(c => {
         if (c && typeof c.index === 'number') {
           byIndex.set(c.index, c);
-          pdfViewer.registerDoc(c.document_id, c.title);
+          textViewer.registerDoc(c.document_id, c.title);
         }
       });
       if (!byIndex.size) return;
@@ -953,36 +912,35 @@
       const textNodes = [];
       let node;
       while ((node = walker.nextNode())) {
-        if (/\[S\d+\]/.test(node.nodeValue)) textNodes.push(node);
+        if (/\[S\d+(?:\s*,\s*S\d+)*\]/.test(node.nodeValue)) textNodes.push(node);
       }
       textNodes.forEach(textNode => {
         const parent = textNode.parentNode;
         if (!parent) return;
-        const parts = textNode.nodeValue.split(/(\[S\d+\])/g);
+        const parts = textNode.nodeValue.split(/(\[S\d+(?:\s*,\s*S\d+)*\])/g);
         const frag = document.createDocumentFragment();
         parts.forEach(part => {
-          const match = part.match(/^\[S(\d+)\]$/);
-          if (!match) {
+          if (!/^\[S/.test(part)) {
             frag.appendChild(document.createTextNode(part));
             return;
           }
-          const idx = parseInt(match[1], 10);
-          const cite = byIndex.get(idx);
-          const a = document.createElement('a');
-          a.className = 'cite';
-          a.href = '#';
-          a.dataset.index = String(idx);
-          a.textContent = part;
-          if (cite && cite.document_id) {
+          const ids = [...part.matchAll(/S(\d+)/g)].map(m => parseInt(m[1], 10));
+          ids.forEach((idx, i) => {
+            const cite = byIndex.get(idx);
+            if (!cite || !cite.document_id) return;
+            const a = document.createElement('a');
+            a.className = 'cite';
+            a.href = '#';
+            a.dataset.index = String(idx);
+            const label = (cite.title || 'Quelle') + ', S. ' + (cite.page_number || 1);
+            a.textContent = '(' + label + ')';
             a.dataset.documentId = cite.document_id;
             a.dataset.page = String(cite.page_number || 1);
             if (cite.snippet) a.dataset.snippet = cite.snippet;
-            if (cite.title) a.title = cite.title + ' · Seite ' + (cite.page_number || 1);
-          } else {
-            a.classList.add('broken');
-            a.title = 'Quelle nicht verfügbar';
-          }
-          frag.appendChild(a);
+            a.title = cite.title + ' · Seite ' + (cite.page_number || 1);
+            if (i > 0) frag.appendChild(document.createTextNode(' '));
+            frag.appendChild(a);
+          });
         });
         parent.replaceChild(frag, textNode);
       });
@@ -996,7 +954,7 @@
       const documentId = a.dataset.documentId;
       if (!documentId) return;
       const page = parseInt(a.dataset.page || '1', 10);
-      pdfViewer.open(documentId, page, a.dataset.snippet || null);
+      textViewer.open(documentId, page, a.dataset.snippet || null);
     });
 
     function setChatBusy(busy) {
