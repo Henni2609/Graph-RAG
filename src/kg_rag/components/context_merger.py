@@ -107,12 +107,27 @@ class ContextMerger:
 
         kept_sections, kept_citations = _trim_middle(doc_sections, all_citations, budget)
 
+        # Renumber [S..] tags sequentially (1..k) so the LLM sees no gaps.
+        new_s = 1
+        renumbered: list[str] = []
+        new_citations: list[dict[str, Any]] = []
+        cit_iter = iter(kept_citations)
+        marker = "[… Mitte gekürzt …]"
+        for sec in kept_sections:
+            if sec == marker:
+                renumbered.append(sec)
+            else:
+                renumbered.append(re.sub(r"^\[S\d+\]", f"[S{new_s}]", sec))
+                c = next(cit_iter)
+                new_citations.append({**c, "index": new_s})
+                new_s += 1
+
         parts: list[str] = []
         if entity_section:
             parts.append(entity_section)
-        parts.extend(kept_sections)
+        parts.extend(renumbered)
         context = "\n\n".join(p for p in parts if p.strip())
-        return context, kept_citations
+        return context, new_citations
 
 
 def _trim_middle(
@@ -128,7 +143,7 @@ def _trim_middle(
     if total <= budget:
         return sections, citations
 
-    marker = "[… gekürzt …]"
+    marker = "[… Mitte gekürzt …]"
     # Budget for actual content: subtract marker + its two surrounding separators.
     usable = budget - len(marker) - sep * 2
     if usable <= 0:
