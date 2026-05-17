@@ -26,6 +26,7 @@ class GraphRetriever:
         self,
         chunk_ids: list[str],
         query_entities: list[str] | None = None,
+        query_embedding: list[float] | None = None,
         hops: int | None = None,
         limit: int | None = None,
         session_id: str = DEFAULT_SESSION_ID,
@@ -36,6 +37,7 @@ class GraphRetriever:
 
         documents = store.graph_search(
             chunk_ids=chunk_ids,
+            query_embedding=query_embedding,
             query_entities=query_entities or [],
             hops=active_hops,
             limit=active_limit,

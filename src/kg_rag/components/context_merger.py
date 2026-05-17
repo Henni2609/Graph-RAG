@@ -46,6 +46,7 @@ class ContextMerger:
                 seen.add(key)
                 meta = document_meta(document)
                 meta.setdefault("retrieval_source", source)
+                meta["relevance"] = getattr(document, "score", None)
                 if getattr(document, "meta", None) is not None:
                     document.meta = meta
                 merged.append(document)
@@ -68,12 +69,14 @@ class ContextMerger:
         if entity_context.strip():
             entity_section = "[Entity-Relationen]\n" + entity_context.strip()
 
-        doc_sections: list[str] = []
-        all_citations: list[dict[str, Any]] = []
+        _SEP = 2  # len("\n\n")
 
-        for index, document in enumerate(documents, start=1):
+        # Build per-document records: (position, header_body, text, citation, source, relevance)
+        records: list[tuple[int, str, str, dict[str, Any], str, float | None]] = []
+        for pos, document in enumerate(documents):
             meta = document_meta(document)
-            retrieval_source = meta.get("retrieval_source", "vector")
+            retrieval_source = str(meta.get("retrieval_source", "vector"))
+            relevance = meta.get("relevance")
             label = "Semantisch relevant" if retrieval_source == "vector" else "Via Graph-Traversal"
             title = meta.get("title") or Path(str(meta.get("source", "unknown"))).name
             chunk_index = meta.get("chunk_index", "?")
@@ -85,101 +88,69 @@ class ContextMerger:
             page_number = max(1, page_number)
             text = document_content(document).strip()
 
-            header = f"[S{index}] [{label}] {title} · Seite {page_number} · Abschnitt {chunk_index}"
+            header_body = f"[{label}] {title} · Seite {page_number} · Abschnitt {chunk_index}"
             if section_title:
-                header += f" · {section_title}"
-            doc_sections.append(f"{header}\n{text}")
-            all_citations.append(
-                {
-                    "index": index,
-                    "document_id": meta.get("document_id"),
-                    "title": title,
-                    "page_number": page_number,
-                    "chunk_index": chunk_index if isinstance(chunk_index, int) else None,
-                    "snippet": text,
-                }
-            )
+                header_body += f" · {section_title}"
 
-        # Keep head + tail, drop the middle when over budget.
-        # Entity section is fixed overhead, always kept.
-        entity_overhead = len(entity_section) + 2 if entity_section else 0
+            citation: dict[str, Any] = {
+                "index": -1,
+                "document_id": meta.get("document_id"),
+                "title": title,
+                "page_number": page_number,
+                "chunk_index": chunk_index if isinstance(chunk_index, int) else None,
+                "snippet": text,
+            }
+            records.append((pos, header_body, text, citation, retrieval_source, relevance))
+
+        entity_overhead = len(entity_section) + _SEP if entity_section else 0
         budget = max(0, self.max_context_chars - entity_overhead)
 
-        kept_sections, kept_citations = _trim_middle(doc_sections, all_citations, budget)
+        kept = _select_by_relevance(records, budget, _SEP)
 
-        # Renumber [S..] tags sequentially (1..k) so the LLM sees no gaps.
-        new_s = 1
-        renumbered: list[str] = []
-        new_citations: list[dict[str, Any]] = []
-        cit_iter = iter(kept_citations)
-        marker = "[… Mitte gekürzt …]"
-        for sec in kept_sections:
-            if sec == marker:
-                renumbered.append(sec)
-            else:
-                renumbered.append(re.sub(r"^\[S\d+\]", f"[S{new_s}]", sec))
-                c = next(cit_iter)
-                new_citations.append({**c, "index": new_s})
-                new_s += 1
-
+        # Render kept records in position order; insert gap marker between non-consecutive chunks.
         parts: list[str] = []
         if entity_section:
             parts.append(entity_section)
-        parts.extend(renumbered)
+
+        new_s = 1
+        new_citations: list[dict[str, Any]] = []
+
+        for _pos, header_body, text, cit, _src, _rel in kept:
+            parts.append(f"[S{new_s}] {header_body}\n{text}")
+            new_citations.append({**cit, "index": new_s})
+            new_s += 1
+
         context = "\n\n".join(p for p in parts if p.strip())
         return context, new_citations
 
 
-def _trim_middle(
-    sections: list[str],
-    citations: list[dict],
+def _select_by_relevance(
+    records: list[tuple],  # (pos, header_body, text, cit, source, relevance)
     budget: int,
-) -> tuple[list[str], list[dict]]:
-    """Keep sections from the head and tail; drop the middle when over budget."""
-    sep = 2  # len("\n\n")
-    if not sections:
-        return [], []
-    total = sum(len(s) + sep for s in sections) - sep
-    if total <= budget:
-        return sections, citations
+    sep: int,
+) -> list[tuple]:
+    """Select records to fit within budget, ordered by cosine score descending."""
+    if not records:
+        return []
 
-    marker = "[… Mitte gekürzt …]"
-    # Budget for actual content: subtract marker + its two surrounding separators.
-    usable = budget - len(marker) - sep * 2
-    if usable <= 0:
-        return [], []
+    costs = [len(hdr) + len(txt) + sep for _, hdr, txt, *_ in records]
+    if sum(costs) <= budget:
+        return records
 
-    # Split evenly: half for head (beginning of document), half for tail (end of document).
-    # Tail gets any odd char so conclusions are never accidentally dropped.
-    head_budget = usable // 2
-    tail_budget = usable - head_budget
+    # All chunks sorted by cosine score desc — graph chunks now have real scores too.
+    all_sorted = sorted(enumerate(records), key=lambda x: -(x[1][5] or 0.0))
 
-    head: list[str] = []
-    head_idx: list[int] = []
-    hc = 0
-    for i, s in enumerate(sections):
-        cost = len(s) + (sep if head else 0)
-        if hc + cost > head_budget:
-            break
-        head.append(s)
-        head_idx.append(i)
-        hc += cost
+    kept_idx: set[int] = set()
+    used = 0
+    for i, _rec in all_sorted:
+        cost = costs[i]
+        if used + cost > budget:
+            continue
+        kept_idx.add(i)
+        used += cost
 
-    tail: list[str] = []
-    tail_idx: list[int] = []
-    tc = 0
-    for i in range(len(sections) - 1, len(head) - 1, -1):
-        cost = len(sections[i]) + (sep if tail else 0)
-        if tc + cost > tail_budget:
-            break
-        tail.insert(0, sections[i])
-        tail_idx.insert(0, i)
-        tc += cost
-
-    kept_sections = head + [marker] + tail
-    kept_idx = set(head_idx) | set(tail_idx)
-    kept_citations = [c for i, c in enumerate(citations) if i in kept_idx]
-    return kept_sections, kept_citations
+    # Return in ascending position order so context mirrors document structure.
+    return [records[i] for i in sorted(kept_idx)]
 
 
 def chunk_key(document: Document) -> str:

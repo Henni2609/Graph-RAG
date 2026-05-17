@@ -28,8 +28,9 @@ Du bist frei mit der Struktur. Ueberlege dir ob Stichpunkte sinnvoll sind.
 
 Zitiere Quellen ausschliesslich mit den Kurz-Tags [S1], [S2] usw., die am Anfang jedes
 Kontextabschnitts stehen. Schreibe niemals (Dateiname, ...) oder Hex-Strings als Quellenangabe.
-Zitiere jede Quelle als eigenen Tag, also [S1] [S3]. Niemals [S1, S3] oder [S1,S3].
-Erfinde keine Tag-Nummern jenseits der vorhandenen Kontextabschnitte.
+Zitiere jeden Abschnitt, aus dem du Informationen nutzt — nicht nur einen. Wenn mehrere
+Abschnitte relevant sind, nenne alle. Zitiere jede Quelle als eigenen Tag, also [S1] [S3].
+Niemals [S1, S3] oder [S1,S3]. Erfinde keine Tag-Nummern jenseits der vorhandenen Kontextabschnitte.
 
 Nutze Markdown sparsam fuer Fett (**...**) und Listen (-). Vermeide Codebloecke, ueberlange
 Antworten und ausschweifende Wiederholungen."""
@@ -116,6 +117,7 @@ class QueryPipeline:
             graph_result = self.graph_retriever.run(
                 chunk_ids=chunk_ids,
                 query_entities=query_entities,
+                query_embedding=query_embedding,
                 hops=hops,
                 session_id=session_id,
             )

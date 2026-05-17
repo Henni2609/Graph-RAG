@@ -346,6 +346,7 @@ class Neo4jGraphStore:
         self,
         *,
         chunk_ids: list[str],
+        query_embedding: list[float] | None = None,
         query_entities: list[str] | None = None,
         hops: int = 2,
         limit: int = 8,
@@ -353,6 +354,17 @@ class Neo4jGraphStore:
     ) -> list[Document]:
         hops = max(1, min(3, hops))
         normalized_entities = [normalize_entity_name(name) for name in query_entities or [] if name]
+        params: dict[str, Any] = {
+            "chunk_ids": chunk_ids,
+            "query_entities": normalized_entities,
+            "limit": limit,
+            "session_id": session_id,
+        }
+        if query_embedding:
+            params["query_embedding"] = query_embedding
+            score_expr = "COALESCE(vector.similarity.cosine(chunk.embedding, $query_embedding), 0.0)"
+        else:
+            score_expr = "1.0"
         records = self.execute_read(
             f"""
             MATCH (seed:Chunk)
@@ -366,7 +378,7 @@ class Neo4jGraphStore:
                    chunk.document_id AS document_id,
                    chunk.source AS source,
                    chunk.title AS title,
-                   1.0 AS score
+                   {score_expr} AS score
             UNION
             MATCH (query_entity:Entity)
             WHERE query_entity.name_normalized IN $query_entities
@@ -380,13 +392,10 @@ class Neo4jGraphStore:
                    chunk.document_id AS document_id,
                    chunk.source AS source,
                    chunk.title AS title,
-                   1.0 AS score
+                   {score_expr} AS score
             LIMIT $limit
             """,
-            chunk_ids=chunk_ids,
-            query_entities=normalized_entities,
-            limit=limit,
-            session_id=session_id,
+            **params,
         )
         return [document_from_record(record, source_label="graph") for record in records]
 
