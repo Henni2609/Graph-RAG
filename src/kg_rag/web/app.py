@@ -342,15 +342,42 @@ def _resolve_pdf_file(session_id: str, document_id: str) -> Path | None:
 
 
 def _extract_pdf_pages(path: Path) -> list[dict[str, Any]]:
-    from pypdf import PdfReader
+    try:
+        from haystack.components.converters.pypdf import PyPDFToDocument
+        from haystack.components.preprocessors import DocumentCleaner
+        from kg_rag.compat import document_content, make_document
+        from kg_rag.pipelines.indexing import _clean_page_text
 
-    reader = PdfReader(str(path))
-    pages: list[dict[str, Any]] = []
-    for idx, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or "").strip()
-        if text:
-            pages.append({"page_number": idx, "text": text})
-    return pages
+        converter = PyPDFToDocument()
+        result = converter.run(sources=[path])
+        if not result["documents"]:
+            return []
+        full_text = document_content(result["documents"][0])
+        indexed_pages = [
+            (i + 1, _clean_page_text(chunk))
+            for i, chunk in enumerate(full_text.split("\x0c"))
+        ]
+        non_empty = [(idx, txt) for idx, txt in indexed_pages if txt]
+        if not non_empty:
+            return []
+        cleaner = DocumentCleaner(remove_repeated_substrings=False)
+        cleaned = cleaner.run(documents=[make_document(txt) for _, txt in non_empty])["documents"]
+        pages: list[dict[str, Any]] = []
+        for (page_idx, _), doc in zip(non_empty, cleaned):
+            text = document_content(doc).strip()
+            if text:
+                pages.append({"page_number": page_idx, "text": text})
+        return pages
+    except Exception:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        pages = []
+        for idx, page in enumerate(reader.pages, start=1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                pages.append({"page_number": idx, "text": text})
+        return pages
 
 
 def _cleanup_session_uploads(session_id: str) -> None:

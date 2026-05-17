@@ -558,20 +558,18 @@
         const needle = snippet.toLowerCase().replace(/\s+/g, ' ').trim();
         if (needle.length < 4) return;
         const targetPage = parseInt(page, 10) || 1;
-        const pageOrder = [targetPage, ...this.pagesByNumber.keys()]
-          .filter((v, i, a) => v && a.indexOf(v) === i);
-        const variants = [
-          needle,
-          needle.split(' ').slice(0, 12).join(' '),
-          needle.split(' ').slice(0, 6).join(' '),
-        ].filter(v => v.length >= 4);
-        for (const num of pageOrder) {
-          const section = this.pagesByNumber.get(num);
-          if (!section) continue;
-          for (const v of variants) {
-            if (this._markInSection(section, v)) return;
-          }
+        const section = this.pagesByNumber.get(targetPage);
+        if (!section) return;
+        // Try full snippet first, then a distinctive mid-section window (skip
+        // the first ~third of words to avoid matching an unrelated page header).
+        if (this._markInSection(section, needle)) return;
+        const words = needle.split(' ');
+        if (words.length >= 8) {
+          const start = Math.floor(words.length / 3);
+          const mid = words.slice(start, start + Math.min(12, words.length - start)).join(' ');
+          if (mid.length >= 8 && this._markInSection(section, mid)) return;
         }
+        // Nothing matched — just stay scrolled to the page, no misleading highlight.
       },
 
       _markInSection(section, needle) {
