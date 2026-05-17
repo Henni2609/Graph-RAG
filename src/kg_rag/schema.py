@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+_VALID_ENTITY_TYPES = frozenset({"Person", "Org", "Konzept", "Location", "Produkt", "Technologie"})
+
 
 @dataclass(frozen=True)
 class Entity:
@@ -12,9 +14,11 @@ class Entity:
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "Entity":
+        raw_type = str(data.get("type", "Konzept")).strip()
+        entity_type = raw_type if raw_type in _VALID_ENTITY_TYPES else "Konzept"
         return cls(
             name=str(data.get("name", "")).strip(),
-            type=str(data.get("type", "Konzept")).strip() or "Konzept",
+            type=entity_type,
             description=str(data.get("description", "")).strip(),
         )
 

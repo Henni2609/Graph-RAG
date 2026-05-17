@@ -914,6 +914,9 @@
       while ((node = walker.nextNode())) {
         if (/\[S\d+(?:\s*,\s*S\d+)*\]/.test(node.nodeValue)) textNodes.push(node);
       }
+      const occurrenceCounter = new Map();
+      const displayNumberByIndex = new Map();
+      let displayCounter = 0;
       textNodes.forEach(textNode => {
         const parent = textNode.parentNode;
         if (!parent) return;
@@ -925,22 +928,32 @@
             return;
           }
           const ids = [...part.matchAll(/S(\d+)/g)].map(m => parseInt(m[1], 10));
-          ids.forEach((idx, i) => {
+          const validIds = ids.filter(idx => {
             const cite = byIndex.get(idx);
-            if (!cite || !cite.document_id) return;
+            return cite && cite.document_id;
+          });
+          if (!validIds.length) return;
+          frag.appendChild(document.createTextNode('('));
+          validIds.forEach((idx, i) => {
+            const cite = byIndex.get(idx);
+            if (i > 0) frag.appendChild(document.createTextNode('; '));
+            const seen = occurrenceCounter.get(idx) || 0;
+            occurrenceCounter.set(idx, seen + 1);
+            const occ = cite.occurrences && cite.occurrences[seen];
+            const snippet = (occ && occ.snippet) || cite.snippet;
             const a = document.createElement('a');
             a.className = 'cite';
             a.href = '#';
             a.dataset.index = String(idx);
-            const label = (cite.title || 'Quelle') + ', S. ' + (cite.page_number || 1);
-            a.textContent = '(' + label + ')';
-            a.dataset.documentId = cite.document_id;
-            a.dataset.page = String(cite.page_number || 1);
-            if (cite.snippet) a.dataset.snippet = cite.snippet;
-            a.title = cite.title + ' · Seite ' + (cite.page_number || 1);
-            if (i > 0) frag.appendChild(document.createTextNode(' '));
+            a.dataset.documentId = (occ && occ.document_id) || cite.document_id;
+            a.dataset.page = String((occ && occ.page_number) || cite.page_number || 1);
+            if (snippet) a.dataset.snippet = snippet;
+            if (!displayNumberByIndex.has(idx)) { displayNumberByIndex.set(idx, ++displayCounter); }
+            a.textContent = 'Q' + displayNumberByIndex.get(idx);
+            a.title = (cite.title || 'Quelle') + ' · Seite ' + ((occ && occ.page_number) || cite.page_number || 1);
             frag.appendChild(a);
           });
+          frag.appendChild(document.createTextNode(')'));
         });
         parent.replaceChild(frag, textNode);
       });

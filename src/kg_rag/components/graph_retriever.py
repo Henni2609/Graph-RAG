@@ -18,7 +18,7 @@ class GraphRetriever:
     ) -> None:
         self.store = store
         self.neo4j_config = neo4j_config
-        self.hops = max(1, min(3, hops))
+        self.hops = hops
         self.limit = limit
 
     @component.output_types(documents=list[Document], entity_context=str)
@@ -31,8 +31,9 @@ class GraphRetriever:
         session_id: str = DEFAULT_SESSION_ID,
     ) -> dict[str, Any]:
         store = self._store()
-        active_hops = max(1, min(3, hops if hops is not None else self.hops))
+        active_hops = hops if hops is not None else self.hops
         active_limit = limit if limit is not None else self.limit
+
         documents = store.graph_search(
             chunk_ids=chunk_ids,
             query_entities=query_entities or [],

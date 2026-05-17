@@ -17,7 +17,7 @@ class _NoopStore:
         self.setup_called = False
         self.persisted: list = []
 
-    def setup_schema(self) -> None:
+    def setup_schema(self, *, dimensions=None) -> None:
         self.setup_called = True
 
     def persist_documents(self, documents, *, overwrite=False, session_id="default", progress=None, batch_size=100):
@@ -25,6 +25,12 @@ class _NoopStore:
         if progress is not None:
             progress("persisting", 0, len(self.persisted))
             progress("persisting", len(self.persisted), len(self.persisted))
+
+    def delete_stale_document_chunks(self, session_id, document_id, valid_chunk_ids):
+        pass
+
+    def store_indexing_meta(self, session_id, model, dimensions):
+        pass
 
     def close(self) -> None:
         pass

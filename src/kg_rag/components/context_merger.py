@@ -50,6 +50,13 @@ class ContextMerger:
                     document.meta = meta
                 merged.append(document)
 
+        def _sort_key(doc: Document) -> tuple:
+            m = document_meta(doc)
+            doc_id = str(m.get("document_id") or "")
+            idx = m.get("chunk_index")
+            return (doc_id, idx if isinstance(idx, int) else 999999)
+
+        merged.sort(key=_sort_key)
         return merged
 
     def format_context(
@@ -57,10 +64,12 @@ class ContextMerger:
         documents: list[Document],
         entity_context: str,
     ) -> tuple[str, list[dict[str, Any]]]:
-        sections: list[str] = []
-        citations: list[dict[str, Any]] = []
+        entity_section = ""
         if entity_context.strip():
-            sections.append("[Entity-Relationen]\n" + entity_context.strip())
+            entity_section = "[Entity-Relationen]\n" + entity_context.strip()
+
+        doc_sections: list[str] = []
+        all_citations: list[dict[str, Any]] = []
 
         for index, document in enumerate(documents, start=1):
             meta = document_meta(document)
@@ -68,18 +77,19 @@ class ContextMerger:
             label = "Semantisch relevant" if retrieval_source == "vector" else "Via Graph-Traversal"
             title = meta.get("title") or Path(str(meta.get("source", "unknown"))).name
             chunk_index = meta.get("chunk_index", "?")
+            section_title = meta.get("section_title", "")
             try:
                 page_number = int(meta.get("page_number") or 1)
             except (TypeError, ValueError):
                 page_number = 1
             page_number = max(1, page_number)
             text = document_content(document).strip()
-            section = (
-                f"[S{index}] [{label}] {title} · Seite {page_number} · Abschnitt {chunk_index}\n"
-                f"{text}"
-            )
-            sections.append(section)
-            citations.append(
+
+            header = f"[S{index}] [{label}] {title} · Seite {page_number} · Abschnitt {chunk_index}"
+            if section_title:
+                header += f" · {section_title}"
+            doc_sections.append(f"{header}\n{text}")
+            all_citations.append(
                 {
                     "index": index,
                     "document_id": meta.get("document_id"),
@@ -90,16 +100,71 @@ class ContextMerger:
                 }
             )
 
-        context = "\n\n".join(section for section in sections if section.strip())
-        if len(context) <= self.max_context_chars:
-            return context, citations
-        truncated = context[: self.max_context_chars].rsplit("\n\n", 1)[0].strip()
-        kept_indexes = {
-            int(match.group(1))
-            for match in _CITATION_TAG.finditer(truncated)
-        }
-        filtered = [c for c in citations if c["index"] in kept_indexes]
-        return truncated, filtered
+        # Keep head + tail, drop the middle when over budget.
+        # Entity section is fixed overhead, always kept.
+        entity_overhead = len(entity_section) + 2 if entity_section else 0
+        budget = max(0, self.max_context_chars - entity_overhead)
+
+        kept_sections, kept_citations = _trim_middle(doc_sections, all_citations, budget)
+
+        parts: list[str] = []
+        if entity_section:
+            parts.append(entity_section)
+        parts.extend(kept_sections)
+        context = "\n\n".join(p for p in parts if p.strip())
+        return context, kept_citations
+
+
+def _trim_middle(
+    sections: list[str],
+    citations: list[dict],
+    budget: int,
+) -> tuple[list[str], list[dict]]:
+    """Keep sections from the head and tail; drop the middle when over budget."""
+    sep = 2  # len("\n\n")
+    if not sections:
+        return [], []
+    total = sum(len(s) + sep for s in sections) - sep
+    if total <= budget:
+        return sections, citations
+
+    marker = "[… gekürzt …]"
+    # Budget for actual content: subtract marker + its two surrounding separators.
+    usable = budget - len(marker) - sep * 2
+    if usable <= 0:
+        return [], []
+
+    # Split evenly: half for head (beginning of document), half for tail (end of document).
+    # Tail gets any odd char so conclusions are never accidentally dropped.
+    head_budget = usable // 2
+    tail_budget = usable - head_budget
+
+    head: list[str] = []
+    head_idx: list[int] = []
+    hc = 0
+    for i, s in enumerate(sections):
+        cost = len(s) + (sep if head else 0)
+        if hc + cost > head_budget:
+            break
+        head.append(s)
+        head_idx.append(i)
+        hc += cost
+
+    tail: list[str] = []
+    tail_idx: list[int] = []
+    tc = 0
+    for i in range(len(sections) - 1, len(head) - 1, -1):
+        cost = len(sections[i]) + (sep if tail else 0)
+        if tc + cost > tail_budget:
+            break
+        tail.insert(0, sections[i])
+        tail_idx.insert(0, i)
+        tc += cost
+
+    kept_sections = head + [marker] + tail
+    kept_idx = set(head_idx) | set(tail_idx)
+    kept_citations = [c for i, c in enumerate(citations) if i in kept_idx]
+    return kept_sections, kept_citations
 
 
 def chunk_key(document: Document) -> str:

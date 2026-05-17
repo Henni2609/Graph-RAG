@@ -60,6 +60,7 @@ class JobState:
     finished_at: float | None = None
     graph: dict[str, Any] | None = None
     future: Future | None = None
+    tmp_dir: Path | None = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -236,6 +237,7 @@ async def _enqueue_upload(file: UploadFile, config: RagConfig, session_id: str) 
         status="queued",
         step="queued",
         estimated_seconds=estimated,
+        tmp_dir=session_dir,
     )
     with JOBS_LOCK:
         _evict_old_jobs(time.time())

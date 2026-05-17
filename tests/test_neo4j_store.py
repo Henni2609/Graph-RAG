@@ -77,7 +77,7 @@ def test_persist_documents_writes_chunks_entities_relations_and_next_edges() -> 
     assert "UNWIND $entities AS row" in queries
     assert "MERGE (c)-[:MENTIONS]->(e)" in queries
     assert "UNWIND $relations AS row" in queries
-    assert "MERGE (source)-[rel:RELATES_TO" in queries
+    assert "MERGE (src)-[rel:RELATES_TO" in queries
     assert "UNWIND $pairs AS pair" in queries
     assert "MERGE (previous)-[:NEXT_CHUNK]->(current)" in queries
     # Genau vier UNWIND-Batches (chunks, entities, relations, next-pairs).

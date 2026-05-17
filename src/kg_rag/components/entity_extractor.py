@@ -47,8 +47,9 @@ def parse_extraction_response(raw_text: str) -> ExtractionResult:
         seen_entities.add(entity.normalized_name())
         entities.append(entity)
 
-    entity_names = {entity.name for entity in entities}
-    normalized_entity_names = {entity.normalized_name() for entity in entities}
+    # Include all relations with non-empty source and target.
+    # Missing endpoint entities are auto-created as 'Konzept' nodes by the
+    # Neo4j MERGE in persist_documents, so no relation is silently dropped.
     relations: list[Relation] = []
     seen_relations: set[tuple[str, str, str]] = set()
     for raw_relation in data.get("relations", []):
@@ -56,16 +57,6 @@ def parse_extraction_response(raw_text: str) -> ExtractionResult:
             continue
         relation = Relation.from_mapping(raw_relation)
         if not relation.source or not relation.target:
-            continue
-        if (
-            relation.source not in entity_names
-            and relation.source.casefold() not in normalized_entity_names
-        ):
-            continue
-        if (
-            relation.target not in entity_names
-            and relation.target.casefold() not in normalized_entity_names
-        ):
             continue
         key = (relation.source.casefold(), relation.target.casefold(), relation.relation.casefold())
         if key in seen_relations:
@@ -94,7 +85,7 @@ class EntityExtractor:
         self,
         generator: Any | None = None,
         llm_config: LLMConfig | None = None,
-        max_tokens: int = 800,
+        max_tokens: int = 1200,
         concurrency: int = 10,
     ) -> None:
         self.generator = generator
@@ -119,6 +110,7 @@ class EntityExtractor:
         workers = min(self.concurrency, total)
 
         def extract(document: Document) -> tuple[list[dict], list[dict]]:
+            chunk_id = document_meta(document).get("chunk_id", "?")
             try:
                 text = run_chat(
                     generator,
@@ -131,11 +123,28 @@ class EntityExtractor:
                     },
                 )
                 result = parse_extraction_response(text)
+                # Retry with a larger budget if the response looks truncated
+                # (JSON parse succeeded but yielded nothing — likely cut off).
+                if not result.entities and text.strip() and not text.strip().endswith("}"):
+                    logger.warning(
+                        f"Extraction for chunk {chunk_id} looks truncated, retrying with larger budget"
+                    )
+                    text = run_chat(
+                        generator,
+                        ENTITY_SYSTEM_PROMPT,
+                        f"Text-Chunk:\n{document_content(document)}",
+                        generation_kwargs={
+                            "temperature": 0,
+                            "max_tokens": self.max_tokens * 2,
+                            "extra_body": {"thinking": {"type": "disabled"}},
+                        },
+                    )
+                    result = parse_extraction_response(text)
                 entities = [entity.__dict__ for entity in result.entities]
                 relations = [relation.__dict__ for relation in result.relations]
                 return entities, relations
             except Exception as exc:
-                logger.warning(f"Entity extraction failed for chunk: {exc}")
+                logger.warning(f"Entity extraction failed for chunk {chunk_id}: {exc}", exc_info=True)
                 return [], []
 
         results: list[tuple[list[dict], list[dict]] | None] = [None] * total

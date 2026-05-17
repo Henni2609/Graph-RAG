@@ -23,7 +23,7 @@ def test_parse_extraction_response_from_fenced_json() -> None:
     result = parse_extraction_response(raw)
 
     assert [entity.name for entity in result.entities] == ["Haystack", "Neo4j"]
-    assert len(result.relations) == 1
+    assert len(result.relations) == 2
     assert result.relations[0].source == "Haystack"
     assert result.relations[0].target == "Neo4j"
 

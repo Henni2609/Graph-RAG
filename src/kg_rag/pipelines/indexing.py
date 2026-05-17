@@ -1,8 +1,30 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Iterable
+
+# Matches academic section headings (short lines, no sentence-ending punctuation).
+# Groups: roman-numeral numbered  "VII. Conclusion",
+#         decimal numbered        "5.2 Managing AI Biases",
+#         bare keyword headings   English + German equivalents
+_HEADING_RE = re.compile(
+    r"^(?:"
+    r"[IVXLC]{1,6}\.\s+\S"           # Roman numeral: "I. Introduction"
+    r"|(?:\d+)(?:\.\d+)*\.?\s+\S"    # Decimal:       "5.2 Managing …" / "5."
+    r"|(?:"
+    # English keywords
+    r"Abstract|Keywords?|References?|Conclusions?|Introduction|Acknowledg(?:e)?ments?"
+    r"|"
+    # German keywords
+    r"Zusammenfassung|Einleitung|Schlussfolgerung(?:en)?|Fazit|"
+    r"Literatur(?:verzeichnis)?|Danksagung|Methodik|Methoden?|Ergebnisse?|"
+    r"Diskussion|Materialien?|Anhang|Abk(?:ü|ue)rzungen?"
+    r")"
+    r").*$",
+    re.IGNORECASE,
+)
 
 from kg_rag.compat import Document, document_content, document_meta, make_document
 from kg_rag.components.entity_extractor import EntityExtractor
@@ -67,13 +89,30 @@ class IndexingPipeline:
 
         enriched_chunks = self.entity_extractor.run(embedded_chunks, progress=progress)["documents"]
 
-        self.store.setup_schema()
+        self.store.setup_schema(dimensions=self.config.embedding_dimensions)
         self.store.persist_documents(
             enriched_chunks,
             overwrite=overwrite,
             session_id=session_id,
             progress=progress,
         )
+
+        # Per-document chunk reconciliation: remove stale chunks left from a
+        # previous index run of the same document (e.g. after content edits).
+        valid_chunks_by_doc: dict[str, set[str]] = defaultdict(set)
+        for chunk in enriched_chunks:
+            meta = document_meta(chunk)
+            doc_id = meta.get("document_id", "")
+            chunk_id = meta.get("chunk_id", "")
+            if doc_id and chunk_id:
+                valid_chunks_by_doc[doc_id].add(chunk_id)
+        for doc_id, valid_ids in valid_chunks_by_doc.items():
+            self.store.delete_stale_document_chunks(session_id, doc_id, valid_ids)
+
+        # Persist embedding model metadata so the query pipeline can detect
+        # model drift after the index has been built.
+        self.store.store_indexing_meta(session_id, self.config.embedding_model, self.config.embedding_dimensions)
+
         emit("done", len(enriched_chunks), len(enriched_chunks))
         return len(enriched_chunks)
 
@@ -115,7 +154,10 @@ def split_documents(
     try:
         from haystack.components.preprocessors import DocumentCleaner, DocumentSplitter
 
-        cleaner = DocumentCleaner()
+        # remove_repeated_substrings=False: legitimate repeated content
+        # (table headers, refrains) must not be silently stripped from the
+        # text that ends up embedded and stored.
+        cleaner = DocumentCleaner(remove_repeated_substrings=False)
         splitter = DocumentSplitter(
             split_by="sentence",
             split_length=split_length,
@@ -156,6 +198,19 @@ def normalize_chunk_metadata(
             page_number = int(page_number) if page_number is not None else 1
         except (TypeError, ValueError):
             page_number = 1
+        section_title = meta.get("section_title") or ""
+        raw_content = document_content(chunk)
+
+        # Embed raw text only — section_title is stored in meta and shown in the
+        # context header by ContextMerger. Prefixing it into the embedded text
+        # skews every chunk in a long section with the same heading vector.
+        content = raw_content
+
+        # Use a position-stable chunk_id (session|doc|index) so that re-indexing
+        # the same document at the same position updates the existing Chunk node
+        # via MERGE rather than creating a parallel orphan node.
+        chunk_id = meta.get("chunk_id") or stable_id(f"{session_id}|{document_id}|{chunk_index}")
+
         meta.update(
             {
                 "source": source,
@@ -164,15 +219,10 @@ def normalize_chunk_metadata(
                 "chunk_index": chunk_index,
                 "page_number": max(1, page_number),
                 "session_id": session_id,
-                "chunk_id": meta.get("chunk_id")
-                or stable_id(f"{session_id}|{document_id}|{chunk_index}|{document_content(chunk)}"),
+                "chunk_id": chunk_id,
             }
         )
-        if getattr(chunk, "meta", None) is not None:
-            chunk.meta = meta
-            normalized.append(chunk)
-        else:
-            normalized.append(make_document(document_content(chunk), meta=meta))
+        normalized.append(make_document(content, meta=meta))
     return normalized
 
 
@@ -182,12 +232,20 @@ def fallback_sentence_split(
     split_length: int,
     split_overlap: int,
 ) -> list[Document]:
-    import re
+    # Split on sentence boundaries, avoiding abbreviations (z.B., Dr., Nr.)
+    # and decimal numbers to reduce incorrect splits.
+    _SENT_SPLIT = re.compile(
+        r"(?<!"           # negative lookbehind:
+        r"(?:[A-Z][a-z])" # abbreviation like "Dr", "Nr", "St"
+        r")"
+        r"(?<!\d)"        # decimal: "3.14"
+        r"(?<=[.!?])\s+"  # actual sentence boundary
+    )
 
     chunks: list[Document] = []
     step = max(1, split_length - split_overlap)
     for document in documents:
-        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", document_content(document)) if part.strip()]
+        sentences = [part.strip() for part in _SENT_SPLIT.split(document_content(document)) if part.strip()]
         if not sentences:
             continue
         for index, start in enumerate(range(0, len(sentences), step)):
@@ -198,6 +256,64 @@ def fallback_sentence_split(
             meta["split_idx"] = index
             chunks.append(make_document(text, meta=meta))
     return chunks
+
+
+def _clean_page_text(text: str) -> str:
+    return re.sub(r"(?m)^\d{1,5}\s*$", "", text).strip()
+
+
+def _segment_into_sections(page_text: str) -> list[tuple[str | None, str]]:
+    """Split page_text at detected heading lines.
+
+    Returns a list of (section_title, body) pairs. Text before the first
+    heading has section_title=None. Headings must be ≤80 chars and must not
+    end with sentence punctuation (.!?), to avoid false positives.
+    """
+    lines = page_text.splitlines()
+    segments: list[tuple[str | None, str]] = []
+    current_title: str | None = None
+    current_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        is_heading = (
+            stripped
+            and len(stripped) <= 80
+            and stripped[-1] not in ".!?"
+            and _HEADING_RE.match(stripped) is not None
+        )
+        if is_heading:
+            body = "\n".join(current_lines).strip()
+            if body or current_title is not None:
+                segments.append((current_title, body))
+            current_title = stripped
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    body = "\n".join(current_lines).strip()
+    if body or current_title is not None:
+        segments.append((current_title, body))
+
+    if not segments:
+        return [(None, page_text)]
+    return segments
+
+
+def _split_into_pages(content: str, source: str, session_id: str) -> list[Document]:
+    base_meta = _source_metadata(Path(source), session_id=session_id)
+    documents: list[Document] = []
+    for page_idx, page_text in enumerate(content.split("\x0c"), start=1):
+        page_text = _clean_page_text(page_text)
+        if not page_text:
+            continue
+        for section_title, body in _segment_into_sections(page_text):
+            text = body if body else page_text
+            meta = {**base_meta, "page_number": page_idx}
+            if section_title:
+                meta["section_title"] = section_title
+            documents.append(make_document(text, meta=meta))
+    return documents
 
 
 def _load_text_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
@@ -255,17 +371,6 @@ def _load_pdf_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_
         return documents
 
 
-def _split_into_pages(content: str, source: str, session_id: str) -> list[Document]:
-    base_meta = _source_metadata(Path(source), session_id=session_id)
-    documents: list[Document] = []
-    for page_idx, page_text in enumerate(content.split("\x0c"), start=1):
-        page_text = page_text.strip()
-        if not page_text:
-            continue
-        documents.append(make_document(page_text, meta={**base_meta, "page_number": page_idx}))
-    return documents
-
-
 def _attach_source_metadata(document: Document, source: str, *, session_id: str) -> None:
     meta = document_meta(document)
     meta.update(_source_metadata(Path(source), session_id=session_id))
@@ -273,8 +378,6 @@ def _attach_source_metadata(document: Document, source: str, *, session_id: str)
 
 
 def _converted_source(document: Document, files: list[Path], index: int) -> str:
-    # Prefer the resolved input path we control; Haystack converters may
-    # store only the basename in file_path, which would resolve against CWD.
     if index < len(files):
         return str(files[index])
     meta = document_meta(document)

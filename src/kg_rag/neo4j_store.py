@@ -9,11 +9,12 @@ from typing import Any, Callable, Iterable, Iterator
 
 from kg_rag.compat import Document, document_content, document_embedding, document_meta, make_document
 from kg_rag.config import Neo4jConfig
+from kg_rag.logging import logger
 from kg_rag.schema import normalize_entity_name
 
 
 VECTOR_INDEX_NAME = "chunk_embeddings"
-EMBEDDING_DIMENSIONS = 384
+_DEFAULT_EMBEDDING_DIMENSIONS = 384
 DEFAULT_SESSION_ID = "default"
 
 
@@ -86,7 +87,23 @@ class Neo4jGraphStore:
             session_id=session_id,
         )
 
-    def setup_schema(self) -> None:
+    def delete_stale_document_chunks(
+        self, session_id: str, document_id: str, valid_chunk_ids: set[str]
+    ) -> None:
+        """Remove chunks of a document that no longer exist after re-indexing."""
+        if not valid_chunk_ids:
+            return
+        self.execute_write(
+            "MATCH (c:Chunk {document_id: $document_id, session_id: $session_id}) "
+            "WHERE NOT c.id IN $valid_ids "
+            "DETACH DELETE c",
+            document_id=document_id,
+            session_id=session_id,
+            valid_ids=list(valid_chunk_ids),
+        )
+
+    def setup_schema(self, *, dimensions: int | None = None) -> None:
+        effective_dim = dimensions if dimensions is not None else _DEFAULT_EMBEDDING_DIMENSIONS
         statements = [
             "DROP CONSTRAINT entity_name_normalized IF EXISTS",
             "CREATE CONSTRAINT document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
@@ -99,13 +116,34 @@ class Neo4jGraphStore:
                 f"CREATE VECTOR INDEX {VECTOR_INDEX_NAME} IF NOT EXISTS "
                 "FOR (c:Chunk) ON (c.embedding) "
                 "OPTIONS {indexConfig: {"
-                f"`vector.dimensions`: {EMBEDDING_DIMENSIONS}, "
+                f"`vector.dimensions`: {effective_dim}, "
                 "`vector.similarity_function`: 'cosine'"
                 "}}"
             ),
         ]
         for statement in statements:
             self.execute_write(statement)
+
+    def store_indexing_meta(self, session_id: str, model: str, dimensions: int) -> None:
+        """Persist the embedding model name and dimensions used for this session."""
+        self.execute_write(
+            """
+            MERGE (m:IndexingMeta {session_id: $session_id})
+            SET m.embedding_model = $model, m.embedding_dimensions = $dimensions
+            """,
+            session_id=session_id,
+            model=model,
+            dimensions=dimensions,
+        )
+
+    def get_indexing_meta(self, session_id: str) -> dict[str, Any] | None:
+        """Return stored embedding model and dimensions for this session, or None."""
+        records = self.execute_read(
+            "MATCH (m:IndexingMeta {session_id: $session_id}) "
+            "RETURN m.embedding_model AS model, m.embedding_dimensions AS dimensions",
+            session_id=session_id,
+        )
+        return dict(records[0]) if records else None
 
     def persist_documents(
         self,
@@ -213,19 +251,22 @@ class Neo4jGraphStore:
                 session_id=session_id,
             )
 
-        # 3) Batch: RELATES_TO between entities
+        # 3) Batch: RELATES_TO — MERGE endpoints so missing entities are auto-created;
+        #    key by (source, target, relation) only to avoid duplicate parallel edges.
         relations_payload: list[dict[str, Any]] = []
         for chunk_id, meta in chunk_metas.items():
             for relation in meta.get("relations") or []:
-                source = normalize_entity_name(str(relation.get("source", "")))
-                target = normalize_entity_name(str(relation.get("target", "")))
+                source_norm = normalize_entity_name(str(relation.get("source", "")))
+                target_norm = normalize_entity_name(str(relation.get("target", "")))
                 relation_type = str(relation.get("relation", "RELATES_TO") or "RELATES_TO")
-                if not source or not target:
+                if not source_norm or not target_norm:
                     continue
                 relations_payload.append(
                     {
-                        "source": source,
-                        "target": target,
+                        "source": source_norm,
+                        "source_name": str(relation.get("source", "")).strip(),
+                        "target": target_norm,
+                        "target_name": str(relation.get("target", "")).strip(),
                         "relation": relation_type,
                         "chunk_id": chunk_id,
                     }
@@ -234,9 +275,16 @@ class Neo4jGraphStore:
             self.execute_write(
                 """
                 UNWIND $relations AS row
-                MATCH (source:Entity {name_normalized: row.source, session_id: $session_id})
-                MATCH (target:Entity {name_normalized: row.target, session_id: $session_id})
-                MERGE (source)-[rel:RELATES_TO {relation: row.relation, chunk_id: row.chunk_id}]->(target)
+                MERGE (src:Entity {name_normalized: row.source, session_id: $session_id})
+                  ON CREATE SET src.name = row.source_name, src.type = 'Konzept'
+                MERGE (tgt:Entity {name_normalized: row.target, session_id: $session_id})
+                  ON CREATE SET tgt.name = row.target_name, tgt.type = 'Konzept'
+                MERGE (src)-[rel:RELATES_TO {relation: row.relation}]->(tgt)
+                  ON CREATE SET rel.chunk_ids = [row.chunk_id]
+                  ON MATCH SET rel.chunk_ids = CASE
+                    WHEN row.chunk_id IN rel.chunk_ids THEN rel.chunk_ids
+                    ELSE rel.chunk_ids + [row.chunk_id]
+                  END
                 """,
                 relations=batch,
                 session_id=session_id,
@@ -269,25 +317,25 @@ class Neo4jGraphStore:
         top_k: int = 5,
         session_id: str = DEFAULT_SESSION_ID,
     ) -> list[Document]:
-        oversample = max(top_k * 5, top_k + 10)
+        # Session-scoped exact cosine: avoids cross-session crowding that breaks
+        # the global-queryNodes+post-filter pattern when multiple sessions share
+        # one index. vector.similarity.cosine() available since Neo4j 5.18.
         records = self.execute_read(
-            f"""
-            CALL db.index.vector.queryNodes($index_name, $oversample, $embedding)
-            YIELD node, score
-            WHERE node.session_id = $session_id
-            RETURN node.id AS id,
-                   node.text AS text,
-                   node.chunk_index AS chunk_index,
-                   node.page_number AS page_number,
-                   node.document_id AS document_id,
-                   node.source AS source,
-                   node.title AS title,
+            """
+            MATCH (c:Chunk)
+            WHERE c.session_id = $session_id AND c.embedding IS NOT NULL
+            WITH c, vector.similarity.cosine(c.embedding, $embedding) AS score
+            RETURN c.id AS id,
+                   c.text AS text,
+                   c.chunk_index AS chunk_index,
+                   c.page_number AS page_number,
+                   c.document_id AS document_id,
+                   c.source AS source,
+                   c.title AS title,
                    score
             ORDER BY score DESC
             LIMIT $top_k
             """,
-            index_name=VECTOR_INDEX_NAME,
-            oversample=oversample,
             top_k=top_k,
             embedding=embedding,
             session_id=session_id,
@@ -444,10 +492,7 @@ def stored_chunk_from_document(
         page_number = int(meta.get("page_number") or 1)
     except (TypeError, ValueError):
         page_number = 1
-    chunk_id = str(
-        meta.get("chunk_id")
-        or stable_id(f"{session_id}|{document_id}|{chunk_index}|{document_content(document)}")
-    )
+    chunk_id = str(meta.get("chunk_id") or stable_id(f"{session_id}|{document_id}|{chunk_index}"))
     return StoredChunk(
         id=chunk_id,
         text=document_content(document),
