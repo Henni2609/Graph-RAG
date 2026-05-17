@@ -96,7 +96,7 @@ class ContextMerger:
                     "title": title,
                     "page_number": page_number,
                     "chunk_index": chunk_index if isinstance(chunk_index, int) else None,
-                    "snippet": text[:240],
+                    "snippet": text,
                 }
             )
 
