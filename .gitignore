@@ -11,3 +11,4 @@ build/
 *.egg-info/
 neo4j_data/
 neo4j_logs/
+.playwright-mcp/
