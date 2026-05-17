@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
@@ -16,6 +17,13 @@ from kg_rag.schema import normalize_entity_name
 VECTOR_INDEX_NAME = "chunk_embeddings"
 _DEFAULT_EMBEDDING_DIMENSIONS = 384
 DEFAULT_SESSION_ID = "default"
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_driver(uri: str, username: str, password: str) -> Any:
+    from neo4j import GraphDatabase
+
+    return GraphDatabase.driver(uri, auth=(username, password))
 
 
 @dataclass(frozen=True)
@@ -35,20 +43,19 @@ class Neo4jGraphStore:
     def __init__(self, config: Neo4jConfig, driver: Any | None = None) -> None:
         self.config = config
         self._driver = driver
+        self._injected_driver = driver is not None
 
     @property
     def driver(self) -> Any:
         if self._driver is None:
-            from neo4j import GraphDatabase
-
-            self._driver = GraphDatabase.driver(
-                self.config.uri,
-                auth=(self.config.username, self.config.password),
+            self._driver = _cached_driver(
+                self.config.uri, self.config.username, self.config.password
             )
         return self._driver
 
     def close(self) -> None:
-        if self._driver is not None:
+        # Only close explicitly-injected drivers; cached drivers live for the process.
+        if self._injected_driver and self._driver is not None:
             self._driver.close()
 
     def clear(self) -> None:
@@ -66,6 +73,16 @@ class Neo4jGraphStore:
         if not session_id or not valid_document_ids:
             return
         valid_ids = list(valid_document_ids)
+        # Cheap read: skip all writes when nothing to clean up (common case).
+        has_orphans = self.execute_read(
+            "MATCH (c:Chunk {session_id: $session_id}) "
+            "WHERE NOT c.document_id IN $valid_ids "
+            "RETURN true AS has_orphans LIMIT 1",
+            session_id=session_id,
+            valid_ids=valid_ids,
+        )
+        if not has_orphans:
+            return
         self.execute_write(
             "MATCH (c:Chunk {session_id: $session_id}) "
             "WHERE NOT c.document_id IN $valid_ids "
@@ -100,6 +117,27 @@ class Neo4jGraphStore:
             document_id=document_id,
             session_id=session_id,
             valid_ids=list(valid_chunk_ids),
+        )
+
+    def delete_stale_chunks_bulk(
+        self, doc_valid_ids: dict[str, list[str]], *, session_id: str
+    ) -> None:
+        payload = [
+            {"doc_id": doc_id, "valid_ids": valid_ids}
+            for doc_id, valid_ids in doc_valid_ids.items()
+            if valid_ids
+        ]
+        if not payload:
+            return
+        self.execute_write(
+            """
+            UNWIND $payload AS row
+            MATCH (c:Chunk {document_id: row.doc_id, session_id: $session_id})
+            WHERE NOT c.id IN row.valid_ids
+            DETACH DELETE c
+            """,
+            payload=payload,
+            session_id=session_id,
         )
 
     def setup_schema(self, *, dimensions: int | None = None) -> None:

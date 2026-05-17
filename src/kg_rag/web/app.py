@@ -21,7 +21,7 @@ from kg_rag.config import RagConfig
 from kg_rag.logging import logger
 from kg_rag.neo4j_store import Neo4jGraphStore, stable_id
 from kg_rag.pipelines.indexing import IndexingPipeline
-from kg_rag.pipelines.query import QueryPipeline
+from kg_rag.pipelines.query import QueryPipeline, embed_query
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -446,10 +446,7 @@ def _reset_uploads() -> None:
 
 def _warmup_embedder(model: str) -> None:
     try:
-        from haystack.components.embedders import SentenceTransformersDocumentEmbedder
-
-        embedder = SentenceTransformersDocumentEmbedder(model=model)
-        embedder.warm_up()
+        embed_query("warmup", model=model)
         logger.info("Embedder warmup complete for %s", model)
     except Exception:
         logger.exception("Embedder warmup failed")

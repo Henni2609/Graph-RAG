@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import functools
+import os
 import re
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 # Matches academic section headings (short lines, no sentence-ending punctuation).
 # Groups: roman-numeral numbered  "VII. Conclusion",
@@ -85,7 +88,9 @@ class IndexingPipeline:
         chunks = normalize_chunk_metadata(chunks, session_id=session_id)
 
         emit("embedding", 0, len(chunks))
-        embedded_chunks = embed_documents(chunks, model=self.config.embedding_model)
+        embedded_chunks = embed_documents(
+            chunks, model=self.config.embedding_model, batch_size=self.config.embedding_batch_size
+        )
 
         enriched_chunks = self.entity_extractor.run(embedded_chunks, progress=progress)["documents"]
 
@@ -106,8 +111,10 @@ class IndexingPipeline:
             chunk_id = meta.get("chunk_id", "")
             if doc_id and chunk_id:
                 valid_chunks_by_doc[doc_id].add(chunk_id)
-        for doc_id, valid_ids in valid_chunks_by_doc.items():
-            self.store.delete_stale_document_chunks(session_id, doc_id, valid_ids)
+        self.store.delete_stale_chunks_bulk(
+            {doc_id: list(valid_ids) for doc_id, valid_ids in valid_chunks_by_doc.items()},
+            session_id=session_id,
+        )
 
         # Persist embedding model metadata so the query pipeline can detect
         # model drift after the index has been built.
@@ -170,14 +177,19 @@ def split_documents(
         return fallback_sentence_split(documents, split_length=split_length, split_overlap=split_overlap)
 
 
-def embed_documents(documents: list[Document], *, model: str) -> list[Document]:
-    if not documents:
-        return []
+@functools.lru_cache(maxsize=None)
+def _get_doc_embedder(model: str, batch_size: int) -> Any:
     from haystack.components.embedders import SentenceTransformersDocumentEmbedder
 
-    embedder = SentenceTransformersDocumentEmbedder(model=model)
+    embedder = SentenceTransformersDocumentEmbedder(model=model, batch_size=batch_size)
     embedder.warm_up()
-    return embedder.run(documents=documents)["documents"]
+    return embedder
+
+
+def embed_documents(documents: list[Document], *, model: str, batch_size: int = 64) -> list[Document]:
+    if not documents:
+        return []
+    return _get_doc_embedder(model, batch_size).run(documents=documents)["documents"]
 
 
 def normalize_chunk_metadata(
@@ -340,35 +352,48 @@ def _load_text_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION
         ]
 
 
-def _load_pdf_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
-    if not files:
-        return []
+def _parse_single_pdf(args: tuple[Path, str]) -> list[Document]:
+    path, session_id = args
     try:
         from haystack.components.converters.pypdf import PyPDFToDocument
 
         converter = PyPDFToDocument()
-        result = converter.run(sources=files)
-        documents: list[Document] = []
-        for index, raw_doc in enumerate(result["documents"]):
-            source = str(files[index]) if index < len(files) else _converted_source(raw_doc, files, index)
-            documents.extend(_split_into_pages(document_content(raw_doc), source, session_id))
-        return documents
+        result = converter.run(sources=[path])
+        if not result["documents"]:
+            return []
+        return _split_into_pages(document_content(result["documents"][0]), str(path), session_id)
     except Exception as exc:
-        logger.warning(f"Haystack PDF converter unavailable, using fallback loader: {exc}")
+        logger.warning(f"Haystack PDF converter failed for {path}, using fallback: {exc}")
         from pypdf import PdfReader
 
         documents = []
-        for path in files:
-            reader = PdfReader(str(path))
-            for page_idx, page in enumerate(reader.pages, start=1):
-                text = page.extract_text() or ""
-                if not text.strip():
-                    continue
-                documents.append(make_document(
-                    text,
-                    meta={**_source_metadata(path, session_id=session_id), "page_number": page_idx},
-                ))
+        reader = PdfReader(str(path))
+        for page_idx, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            if not text.strip():
+                continue
+            documents.append(make_document(
+                text,
+                meta={**_source_metadata(path, session_id=session_id), "page_number": page_idx},
+            ))
         return documents
+
+
+def _load_pdf_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
+    if not files:
+        return []
+    if len(files) == 1:
+        return _parse_single_pdf((files[0], session_id))
+    max_workers = min(len(files), os.cpu_count() or 1)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_parse_single_pdf, (f, session_id)) for f in files]
+    documents = []
+    for f, future in zip(files, futures):
+        try:
+            documents.extend(future.result())
+        except Exception as exc:
+            logger.warning(f"Failed to parse PDF {f}: {exc}")
+    return documents
 
 
 def _attach_source_metadata(document: Document, source: str, *, session_id: str) -> None:

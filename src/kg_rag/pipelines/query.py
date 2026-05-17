@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import functools
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,22 +92,25 @@ class QueryPipeline:
         self._check_embedding_compatibility(session_id)
 
         generator = self._generator()
-        query_entities = self.extract_query_entities(
-            question, generator=self._extraction_generator()
-        )
-        query_embedding = embed_query(question, model=self.config.embedding_model)
+        extraction_gen = self._extraction_generator()
 
-        try:
-            vector_documents = self.store.vector_search(
-                query_embedding,
-                top_k=top_k if top_k is not None else self.config.query_top_k,
-                session_id=session_id,
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            entity_future = pool.submit(
+                self.extract_query_entities, question, generator=extraction_gen
             )
-        except Exception as exc:
-            logger.error(f"Vector search failed: {exc}", exc_info=True)
-            return self._error_result(
-                "Ein Datenbankfehler ist aufgetreten. Bitte versuche es erneut."
-            )
+            query_embedding = embed_query(question, model=self.config.embedding_model)
+            try:
+                vector_documents = self.store.vector_search(
+                    query_embedding,
+                    top_k=top_k if top_k is not None else self.config.query_top_k,
+                    session_id=session_id,
+                )
+            except Exception as exc:
+                logger.error(f"Vector search failed: {exc}", exc_info=True)
+                return self._error_result(
+                    "Ein Datenbankfehler ist aufgetreten. Bitte versuche es erneut."
+                )
+            query_entities = entity_future.result()
 
         chunk_ids = [
             str(document_meta(document).get("chunk_id"))
@@ -264,10 +269,14 @@ def sanitize_citations(answer: str, valid_indexes: set[int]) -> str:
     return re.sub(r"  +", " ", result)
 
 
-def embed_query(question: str, *, model: str) -> list[float]:
+@functools.lru_cache(maxsize=None)
+def _get_text_embedder(model: str) -> Any:
     from haystack.components.embedders import SentenceTransformersTextEmbedder
 
     embedder = SentenceTransformersTextEmbedder(model=model)
     embedder.warm_up()
-    result = embedder.run(text=question)
-    return result["embedding"]
+    return embedder
+
+
+def embed_query(question: str, *, model: str) -> list[float]:
+    return _get_text_embedder(model).run(text=question)["embedding"]

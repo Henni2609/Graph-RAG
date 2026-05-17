@@ -76,10 +76,11 @@ class RagConfig:
     min_similarity: float = 0.25
     max_context_chars: int = 16000
     entity_max_tokens: int = 1200
-    answer_max_tokens: int = 500
+    answer_max_tokens: int = 1500
     answer_timeout_seconds: int = 60
     answer_max_retries: int = 2
     extraction_concurrency: int = 10
+    embedding_batch_size: int = 64
 
     @classmethod
     def from_env(cls) -> "RagConfig":
@@ -97,8 +98,9 @@ class RagConfig:
             min_similarity=_get_float("MIN_SIMILARITY", 0.25),
             max_context_chars=_get_int("MAX_CONTEXT_CHARS", 16000),
             entity_max_tokens=_get_int("ENTITY_MAX_TOKENS", 1200),
-            answer_max_tokens=_get_int("ANSWER_MAX_TOKENS", 500),
+            answer_max_tokens=_get_int("ANSWER_MAX_TOKENS", 1500),
             answer_timeout_seconds=_get_int("ANSWER_TIMEOUT_SECONDS", 60),
             answer_max_retries=_get_int("ANSWER_MAX_RETRIES", 2),
             extraction_concurrency=_get_int("EXTRACTION_CONCURRENCY", 10),
+            embedding_batch_size=_get_int("EMBEDDING_BATCH_SIZE", 64),
         )

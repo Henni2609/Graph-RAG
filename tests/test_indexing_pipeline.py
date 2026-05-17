@@ -29,6 +29,9 @@ class _NoopStore:
     def delete_stale_document_chunks(self, session_id, document_id, valid_chunk_ids):
         pass
 
+    def delete_stale_chunks_bulk(self, doc_valid_ids, *, session_id):
+        pass
+
     def store_indexing_meta(self, session_id, model, dimensions):
         pass
 
@@ -80,7 +83,7 @@ def test_indexing_pipeline_emits_full_step_sequence(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(
         indexing_mod,
         "embed_documents",
-        lambda docs, *, model: docs,
+        lambda docs, *, model, batch_size=64: docs,
     )
 
     pipeline = IndexingPipeline(_build_config(), store=_NoopStore(), entity_extractor=_NoopExtractor())
