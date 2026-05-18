@@ -20,10 +20,12 @@ from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore
 # The LLM must output [S...] tags — they must match context headers exactly.
 ANSWER_SYSTEM_PROMPT = """Du bist ein praeziser Graph-RAG-Assistent.
 Beantworte die Frage auf Deutsch oder Englisch passend zur Sprache der Frage.
-Nutze den bereitgestellten Kontext. Wenn relevante Informationen vorhanden sind, beantworte
-die Frage daraus — auch wenn kein expliziter Abschnitt mit passendem Titel existiert.
-Sage nur dann, dass du nicht antworten kannst, wenn der Kontext keinerlei relevante
-Informationen enthaelt.
+Antworte ausschliesslich auf Basis des bereitgestellten Kontexts. Verwende kein
+eigenes Wissen und keine Informationen ausserhalb des Kontexts. Wenn relevante
+Informationen im Kontext vorhanden sind, beantworte die Frage daraus — auch wenn
+kein expliziter Abschnitt mit passendem Titel existiert. Wenn der Kontext die Frage
+nicht oder nur teilweise abdeckt, sage das klar und antworte nur soweit der Kontext
+reicht. Erfinde keine Fakten.
 
 Laenge der Antwort:
 Antworte so kurz wie moeglich und so ausfuehrlich wie noetig, um die Frage gut zu beantworten.
