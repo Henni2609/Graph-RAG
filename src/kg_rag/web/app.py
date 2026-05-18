@@ -344,8 +344,7 @@ def _resolve_pdf_file(session_id: str, document_id: str) -> Path | None:
 def _extract_pdf_pages(path: Path) -> list[dict[str, Any]]:
     try:
         from haystack.components.converters.pypdf import PyPDFToDocument
-        from haystack.components.preprocessors import DocumentCleaner
-        from kg_rag.compat import document_content, make_document
+        from kg_rag.compat import document_content
         from kg_rag.pipelines.indexing import _clean_page_text
 
         converter = PyPDFToDocument()
@@ -360,11 +359,9 @@ def _extract_pdf_pages(path: Path) -> list[dict[str, Any]]:
         non_empty = [(idx, txt) for idx, txt in indexed_pages if txt]
         if not non_empty:
             return []
-        cleaner = DocumentCleaner(remove_repeated_substrings=False)
-        cleaned = cleaner.run(documents=[make_document(txt) for _, txt in non_empty])["documents"]
         pages: list[dict[str, Any]] = []
-        for (page_idx, _), doc in zip(non_empty, cleaned):
-            text = document_content(doc).strip()
+        for page_idx, txt in non_empty:
+            text = txt.strip()
             if text:
                 pages.append({"page_number": page_idx, "text": text})
         return pages
