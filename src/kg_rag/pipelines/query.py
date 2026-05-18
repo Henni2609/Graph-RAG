@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import functools
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -12,7 +14,7 @@ from kg_rag.components.entity_extractor import parse_extraction_response
 from kg_rag.components.graph_retriever import GraphRetriever
 from kg_rag.config import RagConfig
 from kg_rag.llm import create_chat_generator, run_chat
-from kg_rag.logging import logger
+from kg_rag.logging import log_timing, logger
 from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore
 
 
@@ -52,6 +54,17 @@ _GENERATION_ERROR = (
     "Die Antwortgenerierung ist fehlgeschlagen. Bitte versuche es erneut."
 )
 
+# Per-session cache for embedding meta (model name + dimensions stored at index time).
+# Avoids a Neo4j roundtrip on every query. Invalidated when a new index job completes
+# or the session ends.
+_embedding_meta_cache: dict[str, dict[str, Any]] = {}
+_embedding_meta_lock = threading.Lock()
+
+
+def invalidate_embedding_meta(session_id: str) -> None:
+    with _embedding_meta_lock:
+        _embedding_meta_cache.pop(session_id, None)
+
 
 @dataclass
 class QueryResult:
@@ -62,6 +75,18 @@ class QueryResult:
     entity_context: str
     query_entities: list[str]
     citations: list[dict[str, Any]]
+
+
+@dataclass
+class RetrievalResult:
+    context: str
+    vector_documents: list[Document]
+    graph_documents: list[Document]
+    entity_context: str
+    query_entities: list[str]
+    citations: list[dict[str, Any]]
+    query_embedding: list[float]
+    early_answer: str | None
 
 
 class QueryPipeline:
@@ -84,6 +109,103 @@ class QueryPipeline:
             limit=config.graph_limit,
         )
 
+    def retrieve(
+        self,
+        question: str,
+        *,
+        top_k: int | None = None,
+        hops: int | None = None,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> RetrievalResult:
+        """Run all retrieval steps and return the data needed for answer generation."""
+        self._check_embedding_compatibility(session_id)
+        extraction_gen = self._extraction_generator()
+
+        with log_timing("embedding"):
+            query_embedding = embed_query(
+                question, model=self.config.embedding_model, device=self.config.embedding_device
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            entity_future = pool.submit(
+                self.extract_query_entities, question, generator=extraction_gen
+            )
+            with log_timing("vector_search"):
+                try:
+                    vector_documents = self.store.vector_search(
+                        query_embedding,
+                        top_k=top_k if top_k is not None else self.config.query_top_k,
+                        session_id=session_id,
+                    )
+                except Exception as exc:
+                    logger.error(f"Vector search failed: {exc}", exc_info=True)
+                    return RetrievalResult(
+                        context="",
+                        vector_documents=[],
+                        graph_documents=[],
+                        entity_context="",
+                        query_entities=[],
+                        citations=[],
+                        query_embedding=query_embedding,
+                        early_answer="Ein Datenbankfehler ist aufgetreten. Bitte versuche es erneut.",
+                    )
+            with log_timing("entity_extraction_wait"):
+                query_entities = entity_future.result()
+
+        chunk_ids = [
+            str(document_meta(document).get("chunk_id"))
+            for document in vector_documents
+            if document_meta(document).get("chunk_id")
+        ]
+
+        with log_timing("graph_search"):
+            try:
+                graph_result = self.graph_retriever.run(
+                    chunk_ids=chunk_ids,
+                    query_entities=query_entities,
+                    query_embedding=query_embedding,
+                    hops=hops,
+                    session_id=session_id,
+                )
+            except Exception as exc:
+                logger.error(f"Graph retrieval failed: {exc}", exc_info=True)
+                graph_result = {"documents": [], "entity_context": ""}
+
+        graph_documents = graph_result["documents"]
+        entity_context = graph_result["entity_context"]
+
+        # Only short-circuit when retrieval found literally nothing.
+        # The system prompt handles the "context not sufficient" case for weak matches.
+        if not vector_documents and not graph_documents and not entity_context.strip():
+            return RetrievalResult(
+                context="",
+                vector_documents=vector_documents,
+                graph_documents=[],
+                entity_context=entity_context,
+                query_entities=query_entities,
+                citations=[],
+                query_embedding=query_embedding,
+                early_answer=_INSUFFICIENT_CONTEXT,
+            )
+
+        with log_timing("context_merge"):
+            merge_result = self.merger.run(
+                vector_docs=vector_documents,
+                graph_docs=graph_documents,
+                entity_context=entity_context,
+            )
+
+        return RetrievalResult(
+            context=merge_result["merged_context"],
+            vector_documents=vector_documents,
+            graph_documents=graph_documents,
+            entity_context=entity_context,
+            query_entities=query_entities,
+            citations=merge_result.get("citations", []),
+            query_embedding=query_embedding,
+            early_answer=None,
+        )
+
     def run(
         self,
         question: str,
@@ -92,82 +214,35 @@ class QueryPipeline:
         hops: int | None = None,
         session_id: str = DEFAULT_SESSION_ID,
     ) -> QueryResult:
-        self._check_embedding_compatibility(session_id)
+        t0 = time.perf_counter()
+        retrieval = self.retrieve(question, top_k=top_k, hops=hops, session_id=session_id)
 
-        generator = self._generator()
-        extraction_gen = self._extraction_generator()
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            entity_future = pool.submit(
-                self.extract_query_entities, question, generator=extraction_gen
-            )
-            query_embedding = embed_query(question, model=self.config.embedding_model, device=self.config.embedding_device)
-            try:
-                vector_documents = self.store.vector_search(
-                    query_embedding,
-                    top_k=top_k if top_k is not None else self.config.query_top_k,
-                    session_id=session_id,
-                )
-            except Exception as exc:
-                logger.error(f"Vector search failed: {exc}", exc_info=True)
-                return self._error_result(
-                    "Ein Datenbankfehler ist aufgetreten. Bitte versuche es erneut."
-                )
-            query_entities = entity_future.result()
-
-        chunk_ids = [
-            str(document_meta(document).get("chunk_id"))
-            for document in vector_documents
-            if document_meta(document).get("chunk_id")
-        ]
-
-        try:
-            graph_result = self.graph_retriever.run(
-                chunk_ids=chunk_ids,
-                query_entities=query_entities,
-                query_embedding=query_embedding,
-                hops=hops,
-                session_id=session_id,
-            )
-        except Exception as exc:
-            logger.error(f"Graph retrieval failed: {exc}", exc_info=True)
-            graph_result = {"documents": [], "entity_context": ""}
-
-        graph_documents = graph_result["documents"]
-        entity_context = graph_result["entity_context"]
-
-        # Only short-circuit when retrieval found literally nothing.
-        # The system prompt handles the "context not sufficient" case for weak matches.
-        if not vector_documents and not graph_documents and not entity_context.strip():
+        if retrieval.early_answer is not None:
+            logger.info(f"TIMING total_query: {time.perf_counter() - t0:.3f}s (early exit)")
             return QueryResult(
-                answer=_INSUFFICIENT_CONTEXT,
+                answer=retrieval.early_answer,
                 context="",
-                vector_documents=vector_documents,
-                graph_documents=[],
-                entity_context=entity_context,
-                query_entities=query_entities,
+                vector_documents=retrieval.vector_documents,
+                graph_documents=retrieval.graph_documents,
+                entity_context=retrieval.entity_context,
+                query_entities=retrieval.query_entities,
                 citations=[],
             )
 
-        merge_result = self.merger.run(
-            vector_docs=vector_documents,
-            graph_docs=graph_documents,
-            entity_context=entity_context,
-        )
-        context = merge_result["merged_context"]
-        citations = merge_result.get("citations", [])
+        generator = self._generator()
+        with log_timing("generate_answer"):
+            answer = self.generate_answer(question, retrieval.context, generator=generator)
+        answer = sanitize_citations(answer, {c["index"] for c in retrieval.citations})
 
-        answer = self.generate_answer(question, context, generator=generator)
-        answer = sanitize_citations(answer, {c["index"] for c in citations})
-
+        logger.info(f"TIMING total_query: {time.perf_counter() - t0:.3f}s")
         return QueryResult(
             answer=answer,
-            context=context,
-            vector_documents=vector_documents,
-            graph_documents=graph_documents,
-            entity_context=entity_context,
-            query_entities=query_entities,
-            citations=citations,
+            context=retrieval.context,
+            vector_documents=retrieval.vector_documents,
+            graph_documents=retrieval.graph_documents,
+            entity_context=retrieval.entity_context,
+            query_entities=retrieval.query_entities,
+            citations=retrieval.citations,
         )
 
     def extract_query_entities(self, question: str, *, generator: Any) -> list[str]:
@@ -212,14 +287,20 @@ class QueryPipeline:
         return result
 
     def _check_embedding_compatibility(self, session_id: str) -> None:
-        try:
-            stored = self.store.get_indexing_meta(session_id)
-        except Exception:
-            return
-        if not stored:
-            return
-        stored_model = stored.get("model", "")
-        stored_dim = stored.get("dimensions")
+        with _embedding_meta_lock:
+            cached = _embedding_meta_cache.get(session_id)
+        if cached is None:
+            try:
+                stored = self.store.get_indexing_meta(session_id)
+            except Exception:
+                return
+            if not stored:
+                return
+            with _embedding_meta_lock:
+                _embedding_meta_cache[session_id] = stored
+            cached = stored
+        stored_model = cached.get("model", "")
+        stored_dim = cached.get("dimensions")
         if stored_model and stored_model != self.config.embedding_model:
             raise RuntimeError(
                 f"Embedding model mismatch: index was built with '{stored_model}' "

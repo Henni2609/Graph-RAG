@@ -986,33 +986,70 @@
       const pending = appendMessage('assistant', 'denke nach …', { pending: true });
 
       try {
-        const res = await fetch('/api/query', {
+        const res = await fetch('/api/query/stream', {
           method: 'POST',
           headers: sessionHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ question }),
         });
-        const data = await res.json();
-        pending.remove();
         if (!res.ok) {
-          appendMessage('assistant', data.detail || res.statusText, { error: true });
-          setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
+          const errData = await res.json().catch(() => ({ detail: res.statusText }));
+          pending.remove();
+          appendMessage('assistant', errData.detail || res.statusText, { error: true });
+          setStatus(`Fehler: ${errData.detail || res.statusText}`, 'error');
           return;
         }
-        const meta = [];
-        if (typeof data.vector_chunks === 'number') {
-          meta.push(['Vector-Chunks', data.vector_chunks]);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = '';
+        let eventType = null;
+        let streamMeta = null;
+        let tokens = '';
+        let done = false;
+
+        while (!done) {
+          const { done: streamDone, value } = await reader.read();
+          if (streamDone) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop();
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              let data;
+              try { data = JSON.parse(line.slice(6)); } catch { continue; }
+              if (eventType === 'meta') {
+                streamMeta = data;
+              } else if (eventType === 'token') {
+                tokens += data.delta || '';
+                pending.textContent = tokens + '▌';
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+              } else if (eventType === 'final') {
+                pending.remove();
+                const meta = [];
+                if (streamMeta) {
+                  if (typeof streamMeta.vector_chunks === 'number') meta.push(['Vector-Chunks', streamMeta.vector_chunks]);
+                  if (typeof streamMeta.graph_chunks === 'number') meta.push(['Graph-Chunks', streamMeta.graph_chunks]);
+                  if (Array.isArray(streamMeta.query_entities) && streamMeta.query_entities.length)
+                    meta.push(['Entitäten', streamMeta.query_entities.join(', ')]);
+                }
+                appendMessage('assistant', data.answer || '(leere Antwort)', {
+                  meta,
+                  citations: streamMeta?.citations || [],
+                });
+                setStatus('Antwort geliefert');
+                done = true;
+              } else if (eventType === 'error') {
+                pending.remove();
+                appendMessage('assistant', data.detail || 'Fehler', { error: true });
+                setStatus(`Fehler: ${data.detail || 'Fehler'}`, 'error');
+                done = true;
+              }
+              eventType = null;
+            }
+          }
         }
-        if (typeof data.graph_chunks === 'number') {
-          meta.push(['Graph-Chunks', data.graph_chunks]);
-        }
-        if (Array.isArray(data.query_entities) && data.query_entities.length) {
-          meta.push(['Entitäten', data.query_entities.join(', ')]);
-        }
-        appendMessage('assistant', data.answer || '(leere Antwort)', {
-          meta,
-          citations: data.citations || [],
-        });
-        setStatus('Antwort geliefert');
       } catch (err) {
         pending.remove();
         appendMessage('assistant', err.message, { error: true });

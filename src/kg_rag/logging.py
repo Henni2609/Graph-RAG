@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any
+import time
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 
 try:
@@ -18,3 +20,12 @@ def configure_logging(level: str = "INFO") -> Any:
     else:
         logging.basicConfig(level=level)
     return logger
+
+
+@contextmanager
+def log_timing(label: str) -> Iterator[None]:
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info(f"TIMING {label}: {time.perf_counter() - t0:.3f}s")

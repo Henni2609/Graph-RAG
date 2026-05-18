@@ -12,16 +12,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import asyncio
+
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from kg_rag.config import RagConfig
+from kg_rag.llm import stream_chat_tokens
 from kg_rag.logging import logger
 from kg_rag.neo4j_store import Neo4jGraphStore, stable_id
 from kg_rag.pipelines.indexing import IndexingPipeline, _get_doc_embedder, _resolve_device
-from kg_rag.pipelines.query import QueryPipeline, embed_query
+from kg_rag.pipelines.query import (
+    ANSWER_SYSTEM_PROMPT,
+    QueryPipeline,
+    RetrievalResult,
+    _GENERATION_ERROR,
+    embed_query,
+    invalidate_embedding_meta,
+    sanitize_citations,
+)
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -188,6 +199,75 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         session_id = _require_session_id(x_session_id)
         return _handle_query(request, app_config, session_id)
 
+    @app.post("/api/query/stream")
+    async def query_stream(
+        request: QueryRequest,
+        x_session_id: str | None = Header(default=None),
+    ) -> StreamingResponse:
+        session_id = _require_session_id(x_session_id)
+        question = request.question.strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Frage darf nicht leer sein")
+
+        async def generate() -> Any:
+            pipeline = QueryPipeline(app_config)
+            try:
+                retrieval: RetrievalResult = await asyncio.to_thread(
+                    pipeline.retrieve,
+                    question,
+                    top_k=request.top_k,
+                    hops=request.hops,
+                    session_id=session_id,
+                )
+            except Exception as exc:
+                logger.exception("Stream query retrieval failed")
+                yield f"event: error\ndata: {json.dumps({'detail': f'Anfrage fehlgeschlagen: {exc}'})}\n\n"
+                return
+            finally:
+                try:
+                    pipeline.store.close()
+                except Exception:
+                    pass
+
+            meta_data = {
+                "query_entities": retrieval.query_entities,
+                "vector_chunks": len(retrieval.vector_documents),
+                "graph_chunks": len(retrieval.graph_documents),
+                "citations": retrieval.citations,
+            }
+            yield f"event: meta\ndata: {json.dumps(meta_data)}\n\n"
+
+            if retrieval.early_answer is not None:
+                yield f"event: final\ndata: {json.dumps({'answer': retrieval.early_answer})}\n\n"
+                return
+
+            gk: dict[str, Any] = {
+                "temperature": 0.2,
+                "max_tokens": app_config.answer_max_tokens,
+                "timeout": app_config.answer_timeout_seconds,
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+            prompt = f"Kontext:\n{retrieval.context}\n\nFrage:\n{question}"
+            tokens: list[str] = []
+            try:
+                async for delta in stream_chat_tokens(app_config.llm, ANSWER_SYSTEM_PROMPT, prompt, generation_kwargs=gk):
+                    tokens.append(delta)
+                    yield f"event: token\ndata: {json.dumps({'delta': delta})}\n\n"
+            except Exception as exc:
+                logger.warning(f"Stream answer generation failed: {exc}", exc_info=True)
+                yield f"event: final\ndata: {json.dumps({'answer': _GENERATION_ERROR})}\n\n"
+                return
+
+            valid_indexes = {c["index"] for c in retrieval.citations}
+            full_answer = sanitize_citations("".join(tokens), valid_indexes)
+            yield f"event: final\ndata: {json.dumps({'answer': full_answer})}\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.post("/api/session/end")
     def session_end(payload: SessionEndRequest) -> dict[str, Any]:
         session_id = _require_session_id(payload.session_id)
@@ -199,6 +279,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Session-Cleanup fehlgeschlagen: {exc}") from exc
         finally:
             store.close()
+        invalidate_embedding_meta(session_id)
         _cleanup_session_uploads(session_id)
         return {"deleted": session_id}
 
@@ -274,6 +355,8 @@ def _run_indexing_job(job_id: str, pdf_path: Path, config: RagConfig) -> None:
             session_id=session_id,
             progress=progress,
         )
+        _purge_orphan_chunks(config, session_id)
+        invalidate_embedding_meta(session_id)
         graph_data = _fetch_graph_unsafe(config, session_id)
         _update_job(
             job_id,
@@ -411,7 +494,6 @@ def _handle_query(request: QueryRequest, config: RagConfig, session_id: str) -> 
     if not question:
         raise HTTPException(status_code=400, detail="Frage darf nicht leer sein")
 
-    _purge_orphan_chunks(config, session_id)
     pipeline = QueryPipeline(config)
     try:
         result = pipeline.run(
