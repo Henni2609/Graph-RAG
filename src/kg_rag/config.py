@@ -80,10 +80,10 @@ class RagConfig:
     answer_timeout_seconds: int = 60
     answer_max_retries: int = 2
     extraction_concurrency: int = 30
-    extraction_timeout_seconds: int = 60
+    extraction_timeout_seconds: int = 600
     extraction_max_retries: int = 4
     embedding_batch_size: int = 64
-    embedding_device: str = "auto"
+    embedding_device: str = "cpu"
 
     @classmethod
     def from_env(cls) -> "RagConfig":
@@ -105,8 +105,8 @@ class RagConfig:
             answer_timeout_seconds=_get_int("ANSWER_TIMEOUT_SECONDS", 60),
             answer_max_retries=_get_int("ANSWER_MAX_RETRIES", 2),
             extraction_concurrency=_get_int("EXTRACTION_CONCURRENCY", 30),
-            extraction_timeout_seconds=_get_int("EXTRACTION_TIMEOUT_SECONDS", 60),
+            extraction_timeout_seconds=_get_int("EXTRACTION_TIMEOUT_SECONDS", 600),
             extraction_max_retries=_get_int("EXTRACTION_MAX_RETRIES", 4),
             embedding_batch_size=_get_int("EMBEDDING_BATCH_SIZE", 64),
-            embedding_device=os.getenv("EMBEDDING_DEVICE", "auto"),
+            embedding_device=os.getenv("EMBEDDING_DEVICE", "cpu"),
         )
