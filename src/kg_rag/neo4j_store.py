@@ -37,6 +37,7 @@ class StoredChunk:
     title: str
     session_id: str
     page_number: int = 1
+    section_title: str = ""
 
 
 class Neo4jGraphStore:
@@ -226,6 +227,7 @@ class Neo4jGraphStore:
                     "embedding": c.embedding,
                     "chunk_index": c.chunk_index,
                     "page_number": c.page_number,
+                    "section_title": c.section_title,
                 }
                 for c in batch
             ]
@@ -246,6 +248,7 @@ class Neo4jGraphStore:
                     chunk.document_id = c.document_id,
                     chunk.source = c.source,
                     chunk.title = c.title,
+                    chunk.section_title = c.section_title,
                     chunk.session_id = $session_id
                 MERGE (d)-[:HAS_CHUNK]->(chunk)
                 """,
@@ -370,6 +373,7 @@ class Neo4jGraphStore:
                    c.document_id AS document_id,
                    c.source AS source,
                    c.title AS title,
+                   c.section_title AS section_title,
                    score
             ORDER BY score DESC
             LIMIT $top_k
@@ -416,6 +420,7 @@ class Neo4jGraphStore:
                    chunk.document_id AS document_id,
                    chunk.source AS source,
                    chunk.title AS title,
+                   chunk.section_title AS section_title,
                    {score_expr} AS score
             UNION
             MATCH (query_entity:Entity)
@@ -430,6 +435,7 @@ class Neo4jGraphStore:
                    chunk.document_id AS document_id,
                    chunk.source AS source,
                    chunk.title AS title,
+                   chunk.section_title AS section_title,
                    {score_expr} AS score
             LIMIT $limit
             """,
@@ -540,6 +546,7 @@ def stored_chunk_from_document(
     except (TypeError, ValueError):
         page_number = 1
     chunk_id = str(meta.get("chunk_id") or stable_id(f"{session_id}|{document_id}|{chunk_index}"))
+    section_title = str(meta.get("section_title") or "")
     return StoredChunk(
         id=chunk_id,
         text=document_content(document),
@@ -550,6 +557,7 @@ def stored_chunk_from_document(
         title=title,
         session_id=session_id,
         page_number=max(1, page_number),
+        section_title=section_title,
     )
 
 
@@ -568,6 +576,7 @@ def document_from_record(record: dict[str, Any], *, source_label: str) -> Docume
             "document_id": record.get("document_id"),
             "source": record.get("source"),
             "title": record.get("title"),
+            "section_title": record.get("section_title"),
             "retrieval_source": source_label,
         },
         score=record.get("score"),

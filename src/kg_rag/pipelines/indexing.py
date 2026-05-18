@@ -220,6 +220,7 @@ def normalize_chunk_metadata(
     session_id: str = DEFAULT_SESSION_ID,
 ) -> list[Document]:
     counters: dict[str, int] = defaultdict(int)
+    seen_sections: set[tuple[str, str]] = set()
     normalized: list[Document] = []
     for chunk in chunks:
         meta = document_meta(chunk)
@@ -235,10 +236,14 @@ def normalize_chunk_metadata(
         section_title = meta.get("section_title") or ""
         raw_content = document_content(chunk)
 
-        # Embed raw text only — section_title is stored in meta and shown in the
-        # context header by ContextMerger. Prefixing it into the embedded text
-        # skews every chunk in a long section with the same heading vector.
-        content = raw_content
+        # Embed the section title into the first chunk of each section only —
+        # gives heading-targeted queries a cross-lingual anchor without skewing
+        # every chunk in a long section with the same heading vector.
+        if section_title and (document_id, section_title) not in seen_sections:
+            seen_sections.add((document_id, section_title))
+            content = f"{section_title}\n\n{raw_content}"
+        else:
+            content = raw_content
 
         # Use a position-stable chunk_id (session|doc|index) so that re-indexing
         # the same document at the same position updates the existing Chunk node

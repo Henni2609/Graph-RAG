@@ -87,23 +87,34 @@ def test_segment_german_schlussfolgerung():
 
 # ── normalize_chunk_metadata ───────────────────────────────────────────────────
 
-def test_normalize_does_not_prefix_section_title_into_content():
-    """section_title must be stored in meta only — not prepended to the embedded text.
-    Prepending skews every chunk of a long section with the same heading vector."""
-    doc = make_document("Prompt engineering is game-changing.", meta={
+def test_normalize_prefixes_section_title_into_first_chunk_only():
+    """The first chunk of each section gets the heading prepended so that
+    heading-targeted queries (e.g. German 'Schlussfolgerung' → English 'Conclusion')
+    have a cross-lingual anchor. Subsequent chunks in the same section are left
+    unchanged to avoid skewing every chunk with the same heading vector."""
+    first = make_document("Prompt engineering is game-changing.", meta={
         "source": "/tmp/test.pdf",
         "page_number": 5,
         "section_title": "VII. Conclusion",
     })
-    result = normalize_chunk_metadata([doc], session_id="test")
-    assert len(result) == 1
-    content = result[0].content if hasattr(result[0], "content") else result[0].page_content
-    # Raw content must be preserved unchanged
-    assert "Prompt engineering is game-changing." in content
-    # Section title must NOT be prepended into the embedded text
-    assert not content.startswith("VII. Conclusion\n")
-    # But it must remain accessible via meta for the context header display
+    second = make_document("Organizations can leverage AI through strategic prompting.", meta={
+        "source": "/tmp/test.pdf",
+        "page_number": 5,
+        "section_title": "VII. Conclusion",
+    })
+    result = normalize_chunk_metadata([first, second], session_id="test")
+    assert len(result) == 2
+    first_content = result[0].content if hasattr(result[0], "content") else result[0].page_content
+    second_content = result[1].content if hasattr(result[1], "content") else result[1].page_content
+    # First chunk: section title prepended as cross-lingual anchor
+    assert first_content.startswith("VII. Conclusion\n\n")
+    assert "Prompt engineering is game-changing." in first_content
+    # Second chunk: raw content unchanged — no heading vector skew
+    assert not second_content.startswith("VII. Conclusion")
+    assert "Organizations can leverage AI" in second_content
+    # section_title still accessible via meta on both chunks
     assert result[0].meta["section_title"] == "VII. Conclusion"
+    assert result[1].meta["section_title"] == "VII. Conclusion"
 
 
 def test_normalize_no_section_title_unchanged():
