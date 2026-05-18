@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from kg_rag.config import RagConfig
 from kg_rag.logging import logger
 from kg_rag.neo4j_store import Neo4jGraphStore, stable_id
-from kg_rag.pipelines.indexing import IndexingPipeline
+from kg_rag.pipelines.indexing import IndexingPipeline, _get_doc_embedder, _resolve_device
 from kg_rag.pipelines.query import QueryPipeline, embed_query
 
 
@@ -124,7 +124,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
     def _warm_embedder() -> None:
         threading.Thread(
             target=_warmup_embedder,
-            args=(app_config.embedding_model,),
+            args=(app_config.embedding_model, app_config.embedding_batch_size, app_config.embedding_device),
             name="embedder-warmup",
             daemon=True,
         ).start()
@@ -468,10 +468,11 @@ def _reset_uploads() -> None:
         logger.exception("Failed to clean uploads dir on startup")
 
 
-def _warmup_embedder(model: str) -> None:
+def _warmup_embedder(model: str, batch_size: int, device: str) -> None:
     try:
-        embed_query("warmup", model=model)
-        logger.info("Embedder warmup complete for %s", model)
+        embed_query("warmup", model=model, device=device)
+        _get_doc_embedder(model, batch_size, _resolve_device(device))
+        logger.info(f"Embedder warmup complete for {model} on {_resolve_device(device)}")
     except Exception:
         logger.exception("Embedder warmup failed")
 

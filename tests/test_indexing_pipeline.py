@@ -83,7 +83,7 @@ def test_indexing_pipeline_emits_full_step_sequence(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(
         indexing_mod,
         "embed_documents",
-        lambda docs, *, model, batch_size=64: docs,
+        lambda docs, *, model, batch_size=64, device="auto": docs,
     )
 
     pipeline = IndexingPipeline(_build_config(), store=_NoopStore(), entity_extractor=_NoopExtractor())

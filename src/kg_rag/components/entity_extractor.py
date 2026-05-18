@@ -86,12 +86,16 @@ class EntityExtractor:
         generator: Any | None = None,
         llm_config: LLMConfig | None = None,
         max_tokens: int = 1200,
-        concurrency: int = 10,
+        concurrency: int = 30,
+        timeout: int = 60,
+        max_retries: int = 4,
     ) -> None:
         self.generator = generator
         self.llm_config = llm_config
         self.max_tokens = max_tokens
         self.concurrency = max(1, concurrency)
+        self.timeout = timeout
+        self.max_retries = max_retries
 
     @component.output_types(documents=list[Document])
     def run(
@@ -144,7 +148,10 @@ class EntityExtractor:
                 relations = [relation.__dict__ for relation in result.relations]
                 return entities, relations
             except Exception as exc:
-                logger.warning(f"Entity extraction failed for chunk {chunk_id}: {exc}", exc_info=True)
+                logger.error(
+                    f"Entity extraction failed permanently for chunk {chunk_id} after retries: {exc}",
+                    exc_info=True,
+                )
                 return [], []
 
         results: list[tuple[list[dict], list[dict]] | None] = [None] * total
@@ -185,5 +192,7 @@ class EntityExtractor:
         self.generator = create_chat_generator(
             self.llm_config,
             model=self.llm_config.extraction_model,
+            timeout=float(self.timeout),
+            max_retries=self.max_retries,
         )
         return self.generator

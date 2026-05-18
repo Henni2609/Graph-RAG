@@ -98,7 +98,7 @@ class QueryPipeline:
             entity_future = pool.submit(
                 self.extract_query_entities, question, generator=extraction_gen
             )
-            query_embedding = embed_query(question, model=self.config.embedding_model)
+            query_embedding = embed_query(question, model=self.config.embedding_model, device=self.config.embedding_device)
             try:
                 vector_documents = self.store.vector_search(
                     query_embedding,
@@ -270,13 +270,18 @@ def sanitize_citations(answer: str, valid_indexes: set[int]) -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _get_text_embedder(model: str) -> Any:
+def _get_text_embedder(model: str, device: str) -> Any:
     from haystack.components.embedders import SentenceTransformersTextEmbedder
+    from haystack.utils import ComponentDevice
+    from kg_rag.pipelines.indexing import _resolve_device
 
-    embedder = SentenceTransformersTextEmbedder(model=model)
+    embedder = SentenceTransformersTextEmbedder(
+        model=model,
+        device=ComponentDevice.from_str(_resolve_device(device)),
+    )
     embedder.warm_up()
     return embedder
 
 
-def embed_query(question: str, *, model: str) -> list[float]:
-    return _get_text_embedder(model).run(text=question)["embedding"]
+def embed_query(question: str, *, model: str, device: str = "auto") -> list[float]:
+    return _get_text_embedder(model, device).run(text=question)["embedding"]

@@ -56,6 +56,8 @@ class IndexingPipeline:
             llm_config=config.llm,
             max_tokens=config.entity_max_tokens,
             concurrency=config.extraction_concurrency,
+            timeout=config.extraction_timeout_seconds,
+            max_retries=config.extraction_max_retries,
         )
 
     def run(
@@ -89,7 +91,10 @@ class IndexingPipeline:
 
         emit("embedding", 0, len(chunks))
         embedded_chunks = embed_documents(
-            chunks, model=self.config.embedding_model, batch_size=self.config.embedding_batch_size
+            chunks,
+            model=self.config.embedding_model,
+            batch_size=self.config.embedding_batch_size,
+            device=self.config.embedding_device,
         )
 
         enriched_chunks = self.entity_extractor.run(embedded_chunks, progress=progress)["documents"]
@@ -177,19 +182,36 @@ def split_documents(
         return fallback_sentence_split(documents, split_length=split_length, split_overlap=split_overlap)
 
 
-@functools.lru_cache(maxsize=None)
-def _get_doc_embedder(model: str, batch_size: int) -> Any:
-    from haystack.components.embedders import SentenceTransformersDocumentEmbedder
+def _resolve_device(setting: str) -> str:
+    if setting != "auto":
+        return setting
+    try:
+        import torch
+        return "mps" if torch.backends.mps.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
-    embedder = SentenceTransformersDocumentEmbedder(model=model, batch_size=batch_size)
+
+@functools.lru_cache(maxsize=None)
+def _get_doc_embedder(model: str, batch_size: int, device: str) -> Any:
+    from haystack.components.embedders import SentenceTransformersDocumentEmbedder
+    from haystack.utils import ComponentDevice
+
+    embedder = SentenceTransformersDocumentEmbedder(
+        model=model,
+        batch_size=batch_size,
+        device=ComponentDevice.from_str(device),
+    )
     embedder.warm_up()
     return embedder
 
 
-def embed_documents(documents: list[Document], *, model: str, batch_size: int = 64) -> list[Document]:
+def embed_documents(
+    documents: list[Document], *, model: str, batch_size: int = 64, device: str = "auto"
+) -> list[Document]:
     if not documents:
         return []
-    return _get_doc_embedder(model, batch_size).run(documents=documents)["documents"]
+    return _get_doc_embedder(model, batch_size, _resolve_device(device)).run(documents=documents)["documents"]
 
 
 def normalize_chunk_metadata(
