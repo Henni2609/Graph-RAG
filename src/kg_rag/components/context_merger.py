@@ -92,13 +92,21 @@ class ContextMerger:
             if section_title:
                 header_body += f" · {section_title}"
 
+            # Strip the section-title prefix that indexing prepends to the first chunk
+            # of each section — it doesn't exist contiguously in the PDF and would
+            # break client-side substring matching.
+            if section_title and text.startswith(section_title):
+                snippet = text[len(section_title):].lstrip()
+            else:
+                snippet = text
+
             citation: dict[str, Any] = {
                 "index": -1,
                 "document_id": meta.get("document_id"),
                 "title": title,
                 "page_number": page_number,
                 "chunk_index": chunk_index if isinstance(chunk_index, int) else None,
-                "snippet": text,
+                "snippet": snippet,
             }
             records.append((pos, header_body, text, citation, retrieval_source, relevance))
 

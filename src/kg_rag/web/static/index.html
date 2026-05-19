@@ -610,33 +610,59 @@
         const targetPage = parseInt(page, 10) || 1;
         const section = this.pagesByNumber.get(targetPage);
         if (!section) return;
-        // Try full snippet first, then a distinctive mid-section window (skip
-        // the first ~third of words to avoid matching an unrelated page header).
-        if (this._markInSection(section, needle)) return;
-        const words = needle.split(' ');
-        if (words.length >= 8) {
-          const start = Math.floor(words.length / 3);
-          const mid = words.slice(start, start + Math.min(12, words.length - start)).join(' ');
-          if (mid.length >= 8 && this._markInSection(section, mid)) return;
+        // Anchor-based matching: find the lead and trail phrase on the page and
+        // span between them. Tolerates interior whitespace/hyphenation drift.
+        for (const anchorSize of [8, 5, 3]) {
+          if (this._markWithAnchors(section, needle, anchorSize)) return;
         }
-        // Nothing matched — just stay scrolled to the page, no misleading highlight.
+        // Last resort: highlight the sentence with the highest token overlap.
+        this._markBestSentence(section, needle);
       },
 
-      _markInSection(section, needle) {
+      _markWithAnchors(section, needle, anchorSize) {
         const textNode = section.firstChild;
         if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return false;
         const raw = textNode.nodeValue;
-        // Try direct case-insensitive match first
-        let origStart = raw.toLowerCase().indexOf(needle);
-        let origEnd = origStart >= 0 ? origStart + needle.length : -1;
-        // Fall back to normalized (whitespace-collapsed) match
-        if (origStart < 0) {
-          const normHaystack = raw.toLowerCase().replace(/\s+/g, ' ');
-          const normIdx = normHaystack.indexOf(needle);
-          if (normIdx < 0) return false;
-          [origStart, origEnd] = this._normToOrigRange(raw, normIdx, normIdx + needle.length);
+        const norm = raw.toLowerCase().replace(/\s+/g, ' ');
+        const words = needle.split(' ');
+        const n = Math.min(anchorSize, words.length);
+        const leadPhrase = words.slice(0, n).join(' ');
+        const trailPhrase = words.slice(words.length - n).join(' ');
+        const leadIdx = norm.indexOf(leadPhrase);
+        if (leadIdx < 0) return false;
+        // When lead === trail (short needle) reuse the same match position.
+        const trailIdx = leadPhrase === trailPhrase
+          ? leadIdx
+          : norm.indexOf(trailPhrase, leadIdx);
+        if (trailIdx < 0) return false;
+        const [origStart, origEnd] = this._normToOrigRange(raw, leadIdx, trailIdx + trailPhrase.length);
+        return this._applyMark(textNode, origStart, origEnd);
+      },
+
+      _markBestSentence(section, needle) {
+        const textNode = section.firstChild;
+        if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return;
+        const raw = textNode.nodeValue;
+        const needleTokens = needle.split(' ').filter(w => w.length > 3);
+        if (needleTokens.length === 0) return;
+        const needleSet = new Set(needleTokens);
+        let bestScore = 0, bestStart = -1, bestEnd = -1;
+        const re = /[^.!?\n]+[.!?\n]+/g;
+        let m;
+        while ((m = re.exec(raw)) !== null) {
+          const tokens = m[0].toLowerCase().replace(/\s+/g, ' ').split(' ').filter(w => w.length > 3);
+          const score = tokens.filter(t => needleSet.has(t)).length / needleSet.size;
+          if (score > bestScore) {
+            bestScore = score;
+            bestStart = m.index;
+            bestEnd = m.index + m[0].length;
+          }
         }
-        if (origStart < 0 || origEnd <= origStart || origEnd > raw.length) return false;
+        if (bestScore >= 0.25 && bestStart >= 0) this._applyMark(textNode, bestStart, bestEnd);
+      },
+
+      _applyMark(textNode, origStart, origEnd) {
+        if (origStart < 0 || origEnd <= origStart || origEnd > textNode.nodeValue.length) return false;
         const range = document.createRange();
         range.setStart(textNode, origStart);
         range.setEnd(textNode, origEnd);
@@ -652,7 +678,6 @@
       },
 
       _normToOrigRange(original, normStart, normEnd) {
-        // Build a map: normToOrig[normPos] = origPos for each non-redundant character
         const normToOrig = [];
         let inSpaceRun = false;
         for (let i = 0; i < original.length; i++) {
