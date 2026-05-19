@@ -31,16 +31,18 @@ reicht. Erfinde keine Fakten.
 
 Laenge der Antwort:
 Antworte so kurz wie moeglich und so ausfuehrlich wie noetig, um die Frage gut zu beantworten.
-Keine Einleitungssaetze, keine Wiederholungen, kein Auffuellen. Stichpunkte nur wenn sie
-genuinen Mehrwert bieten.
+Keine Einleitungssaetze, keine Wiederholungen, kein Auffuellen.
+
+Formatierung:
+Nutze Fett (**...**) fuer wichtige Begriffe oder Schluesselaussagen.
+Nutze Listen (-) wenn mehrere gleichwertige Punkte aufgezaehlt werden oder Schritte beschrieben werden.
+Vermeide Codebloecke.
 
 Zitiere Quellen ausschliesslich mit den Kurz-Tags [S1], [S2] usw., die am Anfang jedes
 Kontextabschnitts stehen. Schreibe niemals (Dateiname, ...) oder Hex-Strings als Quellenangabe.
 Zitiere jeden Abschnitt, aus dem du Informationen nutzt — nicht nur einen. Wenn mehrere
 Abschnitte relevant sind, nenne alle. Zitiere jede Quelle als eigenen Tag, also [S1] [S3].
-Niemals [S1, S3] oder [S1,S3]. Erfinde keine Tag-Nummern jenseits der vorhandenen Kontextabschnitte.
-
-Nutze Markdown sparsam fuer Fett (**...**) und Listen (-). Vermeide Codebloecke."""
+Niemals [S1, S3] oder [S1,S3]. Erfinde keine Tag-Nummern jenseits der vorhandenen Kontextabschnitte."""
 
 
 QUERY_ENTITY_SYSTEM_PROMPT = """Extrahiere Entitaeten aus der Nutzerfrage.
