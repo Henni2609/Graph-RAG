@@ -173,7 +173,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         if path is None:
             raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
         try:
-            pages = _extract_pdf_pages(path)
+            pages = _extract_pdf_pages(path, ocr_language=app_config.ocr_language)
         except Exception as exc:
             logger.exception("PDF-Textextraktion fehlgeschlagen für %s", path)
             raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
@@ -464,7 +464,9 @@ def _remove_pdf_manifest(session_id: str, document_id: str) -> None:
         logger.exception("Failed to update PDF manifest for session %s", session_id)
 
 
-def _extract_pdf_pages(path: Path) -> list[dict[str, Any]]:
+def _extract_pdf_pages(path: Path, ocr_language: str = "deu+eng") -> list[dict[str, Any]]:
+    # --- pypdf text extraction ---
+    text_by_page: dict[int, str] = {}
     try:
         from haystack.components.converters.pypdf import PyPDFToDocument
         from kg_rag.compat import document_content
@@ -472,32 +474,58 @@ def _extract_pdf_pages(path: Path) -> list[dict[str, Any]]:
 
         converter = PyPDFToDocument()
         result = converter.run(sources=[path])
-        if not result["documents"]:
-            return []
-        full_text = document_content(result["documents"][0])
-        indexed_pages = [
-            (i + 1, _clean_page_text(chunk))
-            for i, chunk in enumerate(full_text.split("\x0c"))
-        ]
-        non_empty = [(idx, txt) for idx, txt in indexed_pages if txt]
-        if not non_empty:
-            return []
-        pages: list[dict[str, Any]] = []
-        for page_idx, txt in non_empty:
-            text = txt.strip()
-            if text:
-                pages.append({"page_number": page_idx, "text": text})
-        return pages
+        if result["documents"]:
+            full_text = document_content(result["documents"][0])
+            for i, chunk in enumerate(full_text.split("\x0c")):
+                txt = _clean_page_text(chunk).strip()
+                if txt:
+                    text_by_page[i + 1] = txt
     except Exception:
         from pypdf import PdfReader
 
         reader = PdfReader(str(path))
-        pages = []
         for idx, page in enumerate(reader.pages, start=1):
             text = (page.extract_text() or "").strip()
             if text:
-                pages.append({"page_number": idx, "text": text})
-        return pages
+                text_by_page[idx] = text
+
+    # --- OCR extraction from embedded images ---
+    ocr_by_page: dict[int, str] = {}
+    try:
+        import pytesseract
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        for page_idx, page in enumerate(reader.pages, start=1):
+            page_texts: list[str] = []
+            try:
+                images = page.images
+            except Exception:
+                continue
+            for img_file in images:
+                try:
+                    text = pytesseract.image_to_string(img_file.image, lang=ocr_language)
+                    if text.strip():
+                        page_texts.append(text.strip())
+                except pytesseract.TesseractNotFoundError:
+                    break
+                except Exception:
+                    continue
+            if page_texts:
+                ocr_by_page[page_idx] = "\n".join(page_texts)
+    except ImportError:
+        pass
+
+    # --- merge: combine pypdf text + OCR per page ---
+    pages: list[dict[str, Any]] = []
+    for page_idx in sorted(set(text_by_page) | set(ocr_by_page)):
+        parts = []
+        if page_idx in text_by_page:
+            parts.append(text_by_page[page_idx])
+        if page_idx in ocr_by_page:
+            parts.append(ocr_by_page[page_idx])
+        pages.append({"page_number": page_idx, "text": "\n\n".join(parts)})
+    return pages
 
 
 def _cleanup_session_uploads(session_id: str) -> None:

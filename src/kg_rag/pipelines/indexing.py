@@ -79,7 +79,12 @@ class IndexingPipeline:
             return 0
 
         emit("parsing")
-        documents = load_documents(files, session_id=session_id)
+        documents = load_documents(
+            files,
+            session_id=session_id,
+            ocr_enabled=self.config.ocr_enabled,
+            ocr_language=self.config.ocr_language,
+        )
 
         emit("splitting")
         chunks = split_documents(
@@ -146,12 +151,25 @@ def collect_supported_files(paths: Iterable[str | Path]) -> list[Path]:
     return sorted(dict.fromkeys(files))
 
 
-def load_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
+def load_documents(
+    files: list[Path],
+    *,
+    session_id: str = DEFAULT_SESSION_ID,
+    ocr_enabled: bool = True,
+    ocr_language: str = "deu+eng",
+) -> list[Document]:
     text_files = [path for path in files if path.suffix.lower() in {".txt", ".md"}]
     pdf_files = [path for path in files if path.suffix.lower() == ".pdf"]
     documents: list[Document] = []
     documents.extend(_load_text_documents(text_files, session_id=session_id))
-    documents.extend(_load_pdf_documents(pdf_files, session_id=session_id))
+    documents.extend(
+        _load_pdf_documents(
+            pdf_files,
+            session_id=session_id,
+            ocr_enabled=ocr_enabled,
+            ocr_language=ocr_language,
+        )
+    )
     return documents
 
 
@@ -379,41 +397,113 @@ def _load_text_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION
         ]
 
 
-def _parse_single_pdf(args: tuple[Path, str]) -> list[Document]:
-    path, session_id = args
+def _ocr_pages(
+    path: Path,
+    session_id: str,
+    covered_pages: set[int],
+    ocr_language: str,
+) -> list[Document]:
+    try:
+        import pytesseract
+        from pypdf import PdfReader
+    except ImportError:
+        logger.warning(f"pytesseract not installed; skipping OCR for {path.name}")
+        return []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception as exc:
+        logger.warning(f"Cannot open {path} for OCR: {exc}")
+        return []
+
+    documents: list[Document] = []
+    for page_idx, page in enumerate(reader.pages, start=1):
+        if page_idx in covered_pages:
+            continue
+        page_texts: list[str] = []
+        try:
+            images = page.images
+        except Exception:
+            continue
+        for img_file in images:
+            try:
+                text = pytesseract.image_to_string(img_file.image, lang=ocr_language)
+                if text.strip():
+                    page_texts.append(text.strip())
+            except pytesseract.TesseractNotFoundError:
+                # Tesseract binary not on PATH — disable OCR for this run.
+                # Install: brew install tesseract tesseract-lang
+                logger.warning("Tesseract binary not found; OCR disabled for this session")
+                return documents
+            except Exception as exc:
+                logger.debug(f"OCR failed for image on page {page_idx} of {path.name}: {exc}")
+        if page_texts:
+            documents.append(
+                make_document(
+                    "\n".join(page_texts),
+                    meta={
+                        **_source_metadata(path, session_id=session_id),
+                        "page_number": page_idx,
+                        "extraction": "ocr",
+                    },
+                )
+            )
+    return documents
+
+
+def _parse_single_pdf(args: tuple[Path, str, bool, str]) -> list[Document]:
+    path, session_id, ocr_enabled, ocr_language = args
     try:
         from haystack.components.converters.pypdf import PyPDFToDocument
 
         converter = PyPDFToDocument()
         result = converter.run(sources=[path])
-        if not result["documents"]:
-            return []
-        return _split_into_pages(document_content(result["documents"][0]), str(path), session_id)
+        text_docs = (
+            _split_into_pages(document_content(result["documents"][0]), str(path), session_id)
+            if result["documents"]
+            else []
+        )
     except Exception as exc:
         logger.warning(f"Haystack PDF converter failed for {path}, using fallback: {exc}")
         from pypdf import PdfReader
 
-        documents = []
+        text_docs = []
         reader = PdfReader(str(path))
         for page_idx, page in enumerate(reader.pages, start=1):
             text = page.extract_text() or ""
             if not text.strip():
                 continue
-            documents.append(make_document(
+            text_docs.append(make_document(
                 text,
                 meta={**_source_metadata(path, session_id=session_id), "page_number": page_idx},
             ))
-        return documents
+
+    if not ocr_enabled:
+        return text_docs
+
+    # Pass empty covered_pages so OCR runs on images on every page.
+    # For text-only PDFs page.images is empty → no overhead.
+    # For slide/mixed PDFs this captures body content that pypdf misses.
+    return text_docs + _ocr_pages(path, session_id, set(), ocr_language)
 
 
-def _load_pdf_documents(files: list[Path], *, session_id: str = DEFAULT_SESSION_ID) -> list[Document]:
+def _load_pdf_documents(
+    files: list[Path],
+    *,
+    session_id: str = DEFAULT_SESSION_ID,
+    ocr_enabled: bool = True,
+    ocr_language: str = "deu+eng",
+) -> list[Document]:
     if not files:
         return []
     if len(files) == 1:
-        return _parse_single_pdf((files[0], session_id))
+        return _parse_single_pdf((files[0], session_id, ocr_enabled, ocr_language))
     max_workers = min(len(files), os.cpu_count() or 1)
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_parse_single_pdf, (f, session_id)) for f in files]
+        futures = [
+            executor.submit(_parse_single_pdf, (f, session_id, ocr_enabled, ocr_language))
+            for f in files
+        ]
     documents = []
     for f, future in zip(files, futures):
         try:

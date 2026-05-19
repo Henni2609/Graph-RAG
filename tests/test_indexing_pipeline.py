@@ -65,7 +65,7 @@ def test_indexing_pipeline_emits_full_step_sequence(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(
         indexing_mod,
         "load_documents",
-        lambda files, *, session_id="default": [
+        lambda files, *, session_id="default", **_: [
             make_document("paragraph one", meta={"source": str(pdf), "title": pdf.name, "session_id": session_id}),
         ],
     )

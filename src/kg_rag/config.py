@@ -18,6 +18,13 @@ def _get_float(name: str, default: float) -> float:
     return float(value)
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_LLM_MODEL = "deepseek-v4-pro"
 DEFAULT_EXTRACTION_MODEL = "deepseek-v4-flash"
@@ -84,6 +91,8 @@ class RagConfig:
     extraction_max_retries: int = 4
     embedding_batch_size: int = 64
     embedding_device: str = "cpu"
+    ocr_enabled: bool = True
+    ocr_language: str = "deu+eng"
 
     @classmethod
     def from_env(cls) -> "RagConfig":
@@ -109,4 +118,6 @@ class RagConfig:
             extraction_max_retries=_get_int("EXTRACTION_MAX_RETRIES", 4),
             embedding_batch_size=_get_int("EMBEDDING_BATCH_SIZE", 64),
             embedding_device=os.getenv("EMBEDDING_DEVICE", "cpu"),
+            ocr_enabled=_get_bool("OCR_ENABLED", True),
+            ocr_language=os.getenv("OCR_LANGUAGE", "deu+eng"),
         )
