@@ -76,7 +76,7 @@ class RagConfig:
     embedding_dimensions: int = 384
     chunk_split_length: int = 10
     chunk_split_overlap: int = 2
-    query_top_k: int = 8
+    query_top_k: int = 20
     graph_hops: int = 2
     graph_max_hops: int = 3
     graph_limit: int = 8
@@ -103,7 +103,7 @@ class RagConfig:
             embedding_dimensions=_get_int("EMBEDDING_DIMENSIONS", 384),
             chunk_split_length=_get_int("CHUNK_SPLIT_LENGTH", 10),
             chunk_split_overlap=_get_int("CHUNK_SPLIT_OVERLAP", 2),
-            query_top_k=_get_int("QUERY_TOP_K", 8),
+            query_top_k=_get_int("QUERY_TOP_K", 20),
             graph_hops=_get_int("GRAPH_HOPS", 2),
             graph_max_hops=_get_int("GRAPH_MAX_HOPS", 3),
             graph_limit=_get_int("GRAPH_LIMIT", 8),

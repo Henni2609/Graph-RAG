@@ -375,6 +375,48 @@ class Neo4jGraphStore:
         if progress is not None:
             progress("persisting", total_chunks, total_chunks)
 
+    def section_title_search(
+        self,
+        keywords: list[str],
+        *,
+        session_id: str = DEFAULT_SESSION_ID,
+        limit: int = 5,
+    ) -> list[Document]:
+        """Return the first chunk of each section whose title contains any keyword.
+
+        Keywords must already be lower-cased by the caller. Only the lowest-index
+        chunk per matched section_title is returned so that each section contributes
+        a single, well-anchored context entry.
+        """
+        if not keywords:
+            return []
+        records = self.execute_read(
+            """
+            MATCH (c:Chunk)
+            WHERE c.session_id = $session_id
+              AND c.section_title IS NOT NULL
+              AND c.section_title <> ''
+              AND ANY(kw IN $keywords WHERE toLower(c.section_title) CONTAINS kw)
+            WITH c
+            ORDER BY c.chunk_index ASC
+            WITH c.section_title AS section_title, collect(c)[0] AS fc
+            RETURN fc.id AS id,
+                   fc.text AS text,
+                   fc.chunk_index AS chunk_index,
+                   fc.page_number AS page_number,
+                   fc.document_id AS document_id,
+                   fc.source AS source,
+                   fc.title AS title,
+                   fc.section_title AS section_title,
+                   1.0 AS score
+            LIMIT $limit
+            """,
+            keywords=keywords,
+            session_id=session_id,
+            limit=limit,
+        )
+        return [document_from_record(record, source_label="section") for record in records]
+
     def vector_search(
         self,
         embedding: list[float],

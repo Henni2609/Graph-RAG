@@ -319,13 +319,45 @@ def _clean_page_text(text: str) -> str:
     return re.sub(r"(?m)^\d{1,5}\s*$", "", text).strip()
 
 
+# Matches a ToC entry line: any text followed by 2+ dots/spaces and a page number.
+_TOC_LINE_RE = re.compile(r".*?[\s.]{2,}\d{1,4}\s*$")
+# Matches a ToC entry line where pypdf collapses dot-leaders to a single space
+# (e.g. "6 Conclusion, Limitations, and Future Directions 44").
+_TOC_LINE_COMPACT_RE = re.compile(r".+\s\d{1,4}\s*$")
+
+
+def _is_toc_page(page_text: str) -> bool:
+    """Return True when the page looks like a Table of Contents or index page.
+
+    A ToC page is identified by having at least 5 non-empty lines with a
+    majority (≥50%) of them ending in optional dot-leaders/whitespace followed
+    by a page number.  This catches both the standard "Title . . . . 28" form
+    and the collapsed "Title 28" form that pypdf produces when dot-leaders are
+    reduced to a single space.
+    """
+    non_empty = [l.strip() for l in page_text.splitlines() if l.strip()]
+    if len(non_empty) < 5:
+        return False
+    toc_lines = sum(
+        1 for l in non_empty
+        if _TOC_LINE_RE.match(l) or _TOC_LINE_COMPACT_RE.match(l)
+    )
+    return toc_lines / len(non_empty) >= 0.5
+
+
 def _segment_into_sections(page_text: str) -> list[tuple[str | None, str]]:
     """Split page_text at detected heading lines.
 
     Returns a list of (section_title, body) pairs. Text before the first
     heading has section_title=None. Headings must be ≤80 chars and must not
     end with sentence punctuation (.!?), to avoid false positives.
+
+    ToC/index pages are returned as a single untitled segment to prevent
+    each entry from being cloned under a false section_title.
     """
+    if _is_toc_page(page_text):
+        return [(None, page_text)]
+
     lines = page_text.splitlines()
     segments: list[tuple[str | None, str]] = []
     current_title: str | None = None
@@ -365,11 +397,12 @@ def _split_into_pages(content: str, source: str, session_id: str) -> list[Docume
         if not page_text:
             continue
         for section_title, body in _segment_into_sections(page_text):
-            text = body if body else page_text
+            if not body:
+                continue
             meta = {**base_meta, "page_number": page_idx}
             if section_title:
                 meta["section_title"] = section_title
-            documents.append(make_document(text, meta=meta))
+            documents.append(make_document(body, meta=meta))
     return documents
 
 

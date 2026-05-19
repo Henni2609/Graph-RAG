@@ -95,6 +95,9 @@ INDEXING_JOBS: dict[str, JobState] = {}
 JOBS_LOCK = threading.Lock()
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="indexing-job")
 
+_PDF_PAGES_CACHE: dict[str, list[dict[str, Any]]] = {}
+_PDF_PAGES_CACHE_LOCK = threading.Lock()
+
 
 def _require_session_id(header_value: str | None) -> str:
     if not header_value or not SESSION_ID_PATTERN.match(header_value):
@@ -139,6 +142,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             name="embedder-warmup",
             daemon=True,
         ).start()
+        threading.Thread(target=_warmup_pdf_libs, name="pdf-libs-warmup", daemon=True).start()
 
     @app.on_event("shutdown")
     def _shutdown_jobs() -> None:
@@ -172,12 +176,17 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         path = _resolve_pdf_file(session_id, document_id)
         if path is None:
             raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
-        try:
-            pages = _extract_pdf_pages(path, ocr_language=app_config.ocr_language)
-        except Exception as exc:
-            logger.exception("PDF-Textextraktion fehlgeschlagen für %s", path)
-            raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
-        return {"document_id": document_id, "title": path.name, "pages": pages}
+        with _PDF_PAGES_CACHE_LOCK:
+            cached = _PDF_PAGES_CACHE.get(document_id)
+        if cached is None:
+            try:
+                cached = _extract_pdf_pages(path, ocr_language=app_config.ocr_language)
+            except Exception as exc:
+                logger.exception("PDF-Textextraktion fehlgeschlagen für %s", path)
+                raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
+            with _PDF_PAGES_CACHE_LOCK:
+                _PDF_PAGES_CACHE[document_id] = cached
+        return {"document_id": document_id, "title": path.name, "pages": cached}
 
     @app.delete("/api/document/{document_id}")
     def delete_document(
@@ -197,6 +206,8 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             store.close()
         _remove_pdf_manifest(session_id, document_id)
         invalidate_embedding_meta(session_id)
+        with _PDF_PAGES_CACHE_LOCK:
+            _PDF_PAGES_CACHE.pop(document_id, None)
         return {"deleted": document_id}
 
     @app.get("/api/jobs/{job_id}")
@@ -462,6 +473,21 @@ def _remove_pdf_manifest(session_id: str, document_id: str) -> None:
         path.write_text(json.dumps(manifest), encoding="utf-8")
     except Exception:
         logger.exception("Failed to update PDF manifest for session %s", session_id)
+
+
+def _warmup_pdf_libs() -> None:
+    try:
+        from haystack.components.converters.pypdf import PyPDFToDocument  # noqa: F401
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader  # noqa: F401
+    except Exception:
+        pass
+    try:
+        import pytesseract  # noqa: F401
+    except Exception:
+        pass
 
 
 def _extract_pdf_pages(path: Path, ocr_language: str = "deu+eng") -> list[dict[str, Any]]:

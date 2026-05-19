@@ -77,7 +77,12 @@ class ContextMerger:
             meta = document_meta(document)
             retrieval_source = str(meta.get("retrieval_source", "vector"))
             relevance = meta.get("relevance")
-            label = "Semantisch relevant" if retrieval_source == "vector" else "Via Graph-Traversal"
+            if retrieval_source == "vector":
+                label = "Semantisch relevant"
+            elif retrieval_source == "section":
+                label = "Direkt aus Abschnitt"
+            else:
+                label = "Via Graph-Traversal"
             title = meta.get("title") or Path(str(meta.get("source", "unknown"))).name
             chunk_index = meta.get("chunk_index", "?")
             section_title = meta.get("section_title", "")

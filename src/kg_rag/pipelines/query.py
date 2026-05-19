@@ -53,6 +53,42 @@ def _filter_by_similarity(docs: list[Document], threshold: float) -> list[Docume
     return [d for d in docs if getattr(d, "score", None) is None or d.score >= threshold]
 
 
+# Maps lowercase query substrings to the English section-title keyword to search for.
+# A query like "was ist die schlussbetrachtung" triggers a direct Neo4j lookup for
+# chunks whose section_title contains "conclusion", bypassing the similarity filter.
+_SECTION_TRIGGERS: list[tuple[str, str]] = [
+    ("schlussbetrachtung", "conclusion"),
+    ("schlussfolgerung", "conclusion"),
+    ("fazit", "conclusion"),
+    ("zusammenfassung", "abstract"),
+    ("abstract", "abstract"),
+    ("einleitung", "introduction"),
+    ("conclusion", "conclusion"),
+    ("introduction", "introduction"),
+    ("methodik", "methods"),
+    ("methoden", "methods"),
+    ("ergebnisse", "results"),
+    ("results", "results"),
+    ("diskussion", "discussion"),
+    ("discussion", "discussion"),
+    ("referenzen", "references"),
+    ("literatur", "references"),
+    ("references", "references"),
+    ("anhang", "appendix"),
+    ("appendix", "appendix"),
+]
+
+
+def _extract_section_keywords(question: str) -> list[str]:
+    """Return lower-cased English section keywords triggered by the question."""
+    lower = question.lower()
+    found: set[str] = set()
+    for trigger, keyword in _SECTION_TRIGGERS:
+        if trigger in lower:
+            found.add(keyword)
+    return list(found)
+
+
 _INSUFFICIENT_CONTEXT = (
     "Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
 )
@@ -132,10 +168,22 @@ class QueryPipeline:
                 question, model=self.config.embedding_model, device=self.config.embedding_device
             )
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        section_keywords = _extract_section_keywords(question)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
             entity_future = pool.submit(
                 self.extract_query_entities, question, generator=extraction_gen
             )
+            if section_keywords:
+                section_future = pool.submit(
+                    self.store.section_title_search,
+                    section_keywords,
+                    session_id=session_id,
+                    limit=5,
+                )
+            else:
+                section_future = None
+
             with log_timing("vector_search"):
                 try:
                     vector_documents = self.store.vector_search(
@@ -159,6 +207,18 @@ class QueryPipeline:
                 query_entities = entity_future.result()
 
         vector_documents = _filter_by_similarity(vector_documents, self.config.min_similarity)
+
+        # Section-matched docs bypass the similarity threshold — they are retrieved
+        # by structural match (section_title CONTAINS keyword), not cosine distance.
+        if section_future is not None:
+            try:
+                section_docs = section_future.result()
+                seen_ids = {str(document_meta(d).get("chunk_id")) for d in vector_documents}
+                for doc in section_docs:
+                    if str(document_meta(doc).get("chunk_id")) not in seen_ids:
+                        vector_documents.insert(0, doc)
+            except Exception as exc:
+                logger.warning(f"Section title search failed: {exc}")
 
         chunk_ids = [
             str(document_meta(document).get("chunk_id"))

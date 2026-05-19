@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from kg_rag.pipelines.indexing import _segment_into_sections, normalize_chunk_metadata
-from kg_rag.compat import make_document
+from kg_rag.pipelines.indexing import _segment_into_sections, _split_into_pages, normalize_chunk_metadata
+from kg_rag.compat import make_document, document_content
 
 
 def test_segment_detects_roman_headings():
@@ -134,3 +134,67 @@ def test_normalize_chunk_id_is_position_stable():
     doc2 = make_document("Changed content.", meta={"source": "/tmp/stable.pdf"})
     result2 = normalize_chunk_metadata([doc2], session_id="s1")
     assert result1[0].meta["chunk_id"] == result2[0].meta["chunk_id"]
+
+
+# ── ToC page detection ─────────────────────────────────────────────────────────
+
+_TOC_PAGE = (
+    "5 Post-Training 28\n"
+    "5.1 Post-Training Pipeline . . . . . . . . 28\n"
+    "5.2 Post-Training Infrastructures . . . . 33\n"
+    "5.3 Standard Benchmark Evaluation . . . . 36\n"
+    "5.4 Performance on Real-World Tasks . . . 41\n"
+    "5.4.4 Code Agent . . . . . . . . . . . . 44\n"
+    "6 Conclusion, Limitations, and Future Directions 44\n"
+    "A Author List and Acknowledgment 54\n"
+    "A.1 Author List . . . . . . . . . . . . 54\n"
+    "A.2 Acknowledgment . . . . . . . . . . 55\n"
+    "B Evaluation Details 55\n"
+)
+
+
+def test_toc_page_produces_single_untitled_segment():
+    segments = _segment_into_sections(_TOC_PAGE)
+    assert len(segments) == 1
+    title, body = segments[0]
+    assert title is None
+    assert "Conclusion" in body
+
+
+def test_toc_page_segment_title_never_contains_section_names():
+    segments = _segment_into_sections(_TOC_PAGE)
+    titles = [t for t, _ in segments if t]
+    assert not any("Conclusion" in (t or "") for t in titles)
+    assert not any("Post-Training" in (t or "") for t in titles)
+
+
+def test_real_conclusion_page_still_segmented():
+    page = (
+        "6 Conclusion, Limitations, and Future Directions\n"
+        "We have presented DeepSeek-V4, a strong Mixture-of-Experts language model "
+        "comprising 671B total parameters with 37B activated for each token. "
+        "The pre-training of DeepSeek-V4 requires only 2.788M H800 GPU hours. "
+        "Despite the economical training costs, the comprehensive evaluation "
+        "reveals that DeepSeek-V4 achieves state-of-the-art performance among "
+        "open-source models and is competitive with leading closed-source models.\n"
+    )
+    segments = _segment_into_sections(page)
+    titled = [(t, b) for t, b in segments if t]
+    assert titled, "expected at least one titled segment on a real content page"
+    assert any("Conclusion" in (t or "") for t, _ in titled)
+    # Body must contain actual prose, not be empty
+    for _, body in titled:
+        assert len(body) > 50
+
+
+def test_empty_body_heading_does_not_clone_page():
+    # Page whose only heading has no following text — should produce no document
+    # for that heading (the empty-body segment is skipped in _split_into_pages).
+    page = "Some real content here.\n3 Methods\n"
+    docs = _split_into_pages(page, "/tmp/test.pdf", "sess")
+    # The "3 Methods" heading has no body → it must not clone the whole page
+    full_page_clones = [
+        d for d in docs
+        if document_content(d).strip() == page.strip() and d.meta.get("section_title") == "3 Methods"
+    ]
+    assert not full_page_clones
