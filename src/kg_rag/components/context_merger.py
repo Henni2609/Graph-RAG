@@ -106,8 +106,8 @@ class ContextMerger:
         budget = max(0, self.max_context_chars - entity_overhead)
 
         kept = _select_by_relevance(records, budget, _SEP)
+        kept.sort(key=lambda r: -(r[5] or 0.0))
 
-        # Render kept records in position order; insert gap marker between non-consecutive chunks.
         parts: list[str] = []
         if entity_section:
             parts.append(entity_section)

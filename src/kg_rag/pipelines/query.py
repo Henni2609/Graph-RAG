@@ -49,6 +49,10 @@ QUERY_ENTITY_SYSTEM_PROMPT = """Extrahiere Entitaeten aus der Nutzerfrage.
 Antworte ausschliesslich mit JSON:
 {"entities":[{"name":"...","type":"Konzept","description":""}],"relations":[]}"""
 
+def _filter_by_similarity(docs: list[Document], threshold: float) -> list[Document]:
+    return [d for d in docs if getattr(d, "score", None) is None or d.score >= threshold]
+
+
 _INSUFFICIENT_CONTEXT = (
     "Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
 )
@@ -154,6 +158,8 @@ class QueryPipeline:
             with log_timing("entity_extraction_wait"):
                 query_entities = entity_future.result()
 
+        vector_documents = _filter_by_similarity(vector_documents, self.config.min_similarity)
+
         chunk_ids = [
             str(document_meta(document).get("chunk_id"))
             for document in vector_documents
@@ -173,7 +179,7 @@ class QueryPipeline:
                 logger.error(f"Graph retrieval failed: {exc}", exc_info=True)
                 graph_result = {"documents": [], "entity_context": ""}
 
-        graph_documents = graph_result["documents"]
+        graph_documents = _filter_by_similarity(graph_result["documents"], self.config.min_similarity)
         entity_context = graph_result["entity_context"]
 
         # Only short-circuit when retrieval found literally nothing.

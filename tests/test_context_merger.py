@@ -1,4 +1,4 @@
-from kg_rag.compat import make_document
+from kg_rag.compat import document_meta, make_document
 from kg_rag.components.context_merger import ContextMerger
 
 
@@ -69,3 +69,47 @@ def test_context_merger_prioritises_high_relevance_middle_chunk() -> None:
     citations = result["citations"]
     # Citations must be consecutively numbered 1..k with no gaps.
     assert [c["index"] for c in citations] == list(range(1, len(citations) + 1))
+
+
+def test_context_merger_renders_in_relevance_order() -> None:
+    """[S1] must be the highest-relevance chunk regardless of chunk_index position."""
+    low = make_document(
+        "Low relevance text",
+        meta={"chunk_id": "c0", "source": "doc.pdf", "chunk_index": 0},
+        score=0.4,
+    )
+    high = make_document(
+        "High relevance text",
+        meta={"chunk_id": "c5", "source": "doc.pdf", "chunk_index": 5},
+        score=0.9,
+    )
+    mid = make_document(
+        "Mid relevance text",
+        meta={"chunk_id": "c3", "source": "doc.pdf", "chunk_index": 3},
+        score=0.6,
+    )
+    result = ContextMerger(max_context_chars=10000).run(
+        vector_docs=[low, high, mid],
+        graph_docs=[],
+        entity_context="",
+    )
+    ctx = result["merged_context"]
+    assert ctx.index("High relevance text") < ctx.index("Mid relevance text")
+    assert ctx.index("Mid relevance text") < ctx.index("Low relevance text")
+    citations = result["citations"]
+    assert [c["index"] for c in citations] == list(range(1, len(citations) + 1))
+
+
+def test_filter_by_similarity_excludes_low_score_chunks() -> None:
+    """Chunks below threshold are dropped; chunks with no score pass through."""
+    from kg_rag.pipelines.query import _filter_by_similarity
+
+    high = make_document("kept", meta={"chunk_id": "c1"}, score=0.8)
+    low = make_document("dropped", meta={"chunk_id": "c2"}, score=0.1)
+    no_score = make_document("pass-through", meta={"chunk_id": "c3"})
+
+    result = _filter_by_similarity([high, low, no_score], threshold=0.25)
+    ids = {document_meta(d).get("chunk_id") for d in result}
+    assert "c1" in ids
+    assert "c2" not in ids
+    assert "c3" in ids
