@@ -995,6 +995,29 @@
       return msg;
     }
 
+    function renderStreamingCitations(text, citations) {
+      if (!citations || !citations.length) return text;
+      const byIndex = new Map();
+      citations.forEach(c => {
+        if (c && typeof c.index === 'number' && c.document_id) byIndex.set(c.index, c);
+      });
+      if (!byIndex.size) return text;
+      const displayNumberByIndex = new Map();
+      let displayCounter = 0;
+      // Strip trailing incomplete tag fragment (e.g. "[S" or "[S1") so it doesn't flash raw
+      const displayText = text.replace(/\[S[^[\]]*$/, '');
+      return displayText.replace(/\[S\d+(?:\s*,\s*S\d+)*\]/g, tag => {
+        const ids = [...tag.matchAll(/S(\d+)/g)].map(m => parseInt(m[1], 10));
+        const validIds = ids.filter(idx => byIndex.has(idx));
+        if (!validIds.length) return '';
+        const labels = validIds.map(idx => {
+          if (!displayNumberByIndex.has(idx)) displayNumberByIndex.set(idx, ++displayCounter);
+          return 'Q' + displayNumberByIndex.get(idx);
+        });
+        return '(' + labels.join('; ') + ')';
+      });
+    }
+
     function decorateCitations(body, citations) {
       if (!citations.length) return;
       const byIndex = new Map();
@@ -1122,7 +1145,8 @@
                 streamMeta = data;
               } else if (eventType === 'token') {
                 tokens += data.delta || '';
-                pending.textContent = tokens + '▌';
+                const shown = renderStreamingCitations(tokens, streamMeta?.citations || []);
+                pending.textContent = shown + '▌';
                 chatMessages.scrollTop = chatMessages.scrollHeight;
               } else if (eventType === 'final') {
                 pending.remove();
