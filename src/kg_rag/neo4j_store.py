@@ -105,6 +105,30 @@ class Neo4jGraphStore:
             session_id=session_id,
         )
 
+    def delete_document(self, session_id: str, document_id: str) -> None:
+        if not session_id or not document_id:
+            return
+        self.execute_write(
+            "MATCH (c:Chunk {session_id: $session_id}) "
+            "WHERE c.document_id = $document_id "
+            "DETACH DELETE c",
+            session_id=session_id,
+            document_id=document_id,
+        )
+        self.execute_write(
+            "MATCH (d:Document {session_id: $session_id}) "
+            "WHERE d.id = $document_id "
+            "DETACH DELETE d",
+            session_id=session_id,
+            document_id=document_id,
+        )
+        self.execute_write(
+            "MATCH (e:Entity {session_id: $session_id}) "
+            "WHERE NOT (e)<-[:MENTIONS]-(:Chunk) "
+            "DETACH DELETE e",
+            session_id=session_id,
+        )
+
     def delete_stale_document_chunks(
         self, session_id: str, document_id: str, valid_chunk_ids: set[str]
     ) -> None:

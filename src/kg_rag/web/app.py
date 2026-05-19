@@ -179,6 +179,26 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
         return {"document_id": document_id, "title": path.name, "pages": pages}
 
+    @app.delete("/api/document/{document_id}")
+    def delete_document(
+        document_id: str,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        session_id = _require_session_id(x_session_id)
+        if not DOCUMENT_ID_PATTERN.match(document_id):
+            raise HTTPException(status_code=400, detail="Ungültige Dokument-ID")
+        store = Neo4jGraphStore(app_config.neo4j)
+        try:
+            store.delete_document(session_id, document_id)
+        except Exception as exc:
+            logger.exception("Dokument-Löschung fehlgeschlagen für %s", document_id)
+            raise HTTPException(status_code=500, detail=f"Löschen fehlgeschlagen: {exc}") from exc
+        finally:
+            store.close()
+        _remove_pdf_manifest(session_id, document_id)
+        invalidate_embedding_meta(session_id)
+        return {"deleted": document_id}
+
     @app.get("/api/jobs/{job_id}")
     def job_status(
         job_id: str,
@@ -422,6 +442,26 @@ def _resolve_pdf_file(session_id: str, document_id: str) -> Path | None:
     if not candidate.is_file():
         return None
     return candidate
+
+
+def _remove_pdf_manifest(session_id: str, document_id: str) -> None:
+    path = _manifest_path(session_id)
+    try:
+        manifest: dict[str, str] = json.loads(path.read_text("utf-8")) if path.exists() else {}
+    except Exception:
+        manifest = {}
+    filename = manifest.pop(document_id, None)
+    if filename:
+        pdf_path = _resolve_pdf_file(session_id, document_id)
+        if pdf_path is not None:
+            try:
+                pdf_path.unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Failed to delete PDF file for document %s", document_id)
+    try:
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+    except Exception:
+        logger.exception("Failed to update PDF manifest for session %s", session_id)
 
 
 def _extract_pdf_pages(path: Path) -> list[dict[str, Any]]:

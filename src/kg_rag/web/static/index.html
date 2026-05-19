@@ -146,6 +146,19 @@
     .file-list .err { color: #e25c5c; flex-shrink: 0; }
     .file-list .name { word-break: break-all; }
     .file-list .meta { color: #4a5160; font-size: 11px; }
+    .file-list .del { margin-left: auto; background: none; border: none; padding: 0; color: #3a4050; cursor: pointer; line-height: 1; flex-shrink: 0; display: flex; align-items: center; opacity: 0; transition: opacity 0.15s, color 0.15s; }
+    .file-list li:hover .del { opacity: 1; }
+    .file-list .del:hover { color: #e25c5c; }
+    #confirm-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 1000; align-items: center; justify-content: center; }
+    #confirm-overlay.visible { display: flex; }
+    #confirm-box { background: #161a22; border: 1px solid #2a2f3a; border-radius: 10px; padding: 24px 28px; width: 300px; display: flex; flex-direction: column; gap: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+    #confirm-box p { font-size: 13px; color: #c9cdd6; line-height: 1.5; text-align: center; }
+    #confirm-box .actions { display: flex; gap: 8px; justify-content: center; align-items: center; }
+    #confirm-box button { display: inline-block; height: 32px; line-height: 32px; padding: 0 16px; border-radius: 6px; border: none; font-size: 12px; font-family: inherit; cursor: pointer; transition: background 0.15s; -webkit-appearance: none; appearance: none; vertical-align: middle; }
+    #confirm-cancel { background: #1f232b; color: #8b94a3; }
+    #confirm-cancel:hover { background: #2a2f3a; color: #c9cdd6; }
+    #confirm-ok { background: #7a2020; color: #f0c0c0; }
+    #confirm-ok:hover { background: #a02828; color: #fff; }
 
     .view {
       flex: 1;
@@ -380,10 +393,10 @@
 </head>
 <body>
   <header>
-    <h1>Graph RAG · Knowledge Graph</h1>
+    <h1>Graph RAG · <span style="font-weight:400">Hendrik Braun</span></h1>
     <div class="tabs" role="tablist">
-      <button class="tab active" id="tab-graph" data-view="graph" role="tab">Graph</button>
-      <button class="tab" id="tab-chat" data-view="chat" role="tab">Chat</button>
+      <button class="tab" id="tab-graph" data-view="graph" role="tab">Graph</button>
+      <button class="tab active" id="tab-chat" data-view="chat" role="tab">Chat</button>
     </div>
     <span id="status">bereit</span>
   </header>
@@ -400,19 +413,19 @@
       </div>
       <ul class="file-list" id="files"></ul>
     </aside>
-    <section id="view-graph" class="view active">
+    <section id="view-graph" class="view">
       <div id="graph">
         <div id="graph-empty">noch keine Entitäten</div>
       </div>
     </section>
-    <section id="view-chat" class="view">
+    <section id="view-chat" class="view active">
       <div id="doc-pane">
         <div id="doc-toolbar">
           <span id="doc-title">Quelle</span>
         </div>
         <div id="doc-text-wrap">
           <div id="doc-empty">
-            Klicke auf eine Quelle wie [S1] in einer Antwort, um den passenden Abschnitt zu sehen.
+            Klicke auf eine Quelle wie [Q1] in einer Antwort, um den passenden Abschnitt zu sehen.
           </div>
           <article id="doc-text" hidden></article>
         </div>
@@ -421,7 +434,6 @@
         <div id="chat-messages">
           <div id="chat-empty">
             Stelle eine Frage zu den indexierten PDFs.
-            <div class="examples">z. B. „Welche Technologien werden im Dokument erwähnt?"</div>
           </div>
         </div>
         <div id="chat-input-wrap">
@@ -435,6 +447,15 @@
       </div>
     </section>
   </main>
+  <div id="confirm-overlay">
+    <div id="confirm-box">
+      <p id="confirm-msg">PDF aus dem Kontext entfernen?</p>
+      <div class="actions">
+        <button id="confirm-cancel">Abbrechen</button>
+        <button id="confirm-ok">Entfernen</button>
+      </div>
+    </div>
+  </div>
   <script>
     const dropArea = document.getElementById('drop-area');
     const fileInput = document.getElementById('file-input');
@@ -640,7 +661,48 @@
       tab.addEventListener('click', () => switchView(tab.dataset.view));
     });
 
-    function addFileEntry(name, meta, ok) {
+    const confirmOverlay = document.getElementById('confirm-overlay');
+    const confirmCancel = document.getElementById('confirm-cancel');
+    const confirmOk = document.getElementById('confirm-ok');
+    let _confirmResolve = null;
+    function showConfirm() {
+      confirmOverlay.classList.add('visible');
+      return new Promise(resolve => { _confirmResolve = resolve; });
+    }
+    confirmOk.addEventListener('click', () => { confirmOverlay.classList.remove('visible'); _confirmResolve && _confirmResolve(true); });
+    confirmCancel.addEventListener('click', () => { confirmOverlay.classList.remove('visible'); _confirmResolve && _confirmResolve(false); });
+    confirmOverlay.addEventListener('click', (e) => { if (e.target === confirmOverlay) { confirmOverlay.classList.remove('visible'); _confirmResolve && _confirmResolve(false); } });
+
+    filesEl.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.del');
+      if (!btn) return;
+      const li = btn.closest('li');
+      const documentId = li && li.dataset.documentId;
+      if (!documentId) return;
+      if (!await showConfirm()) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/document/${documentId}`, {
+          method: 'DELETE',
+          headers: sessionHeaders(),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setStatus(`Fehler beim Löschen: ${data.detail || res.statusText}`, 'error');
+          btn.disabled = false;
+          return;
+        }
+        li.remove();
+        textViewer.knownDocs.delete(documentId);
+        await loadGraph();
+        setStatus('PDF aus Kontext entfernt');
+      } catch (err) {
+        setStatus(`Fehler beim Löschen: ${err.message}`, 'error');
+        btn.disabled = false;
+      }
+    });
+
+    function addFileEntry(name, meta, ok, documentId) {
       const li = document.createElement('li');
       const mark = document.createElement('span');
       mark.className = ok ? 'ok' : 'err';
@@ -652,6 +714,14 @@
       metaEl.className = 'meta';
       metaEl.textContent = meta;
       li.append(mark, nameEl, metaEl);
+      if (ok && documentId) {
+        li.dataset.documentId = documentId;
+        const delBtn = document.createElement('button');
+        delBtn.className = 'del';
+        delBtn.title = 'Aus Kontext entfernen';
+        delBtn.innerHTML = '<svg width="11" height="12" viewBox="0 0 11 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 3h9M4 3V2h3v1M2 3l.7 7.5h5.6L9 3"/></svg>';
+        li.append(delBtn);
+      }
       filesEl.prepend(li);
     }
 
@@ -841,7 +911,7 @@
             activePoll = null;
             hideProgress();
             dropArea.classList.remove('busy');
-            addFileEntry(filename, `${data.chunks_indexed} Chunks`, true);
+            addFileEntry(filename, `${data.chunks_indexed} Chunks`, true, data.document_id);
             if (data.graph) renderGraph(data.graph);
             if (data.document_id) textViewer.registerDoc(data.document_id, filename);
             setStatus(data.graph ? graphSummary(data.graph) : 'Fertig');
