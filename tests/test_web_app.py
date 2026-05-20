@@ -9,7 +9,7 @@ from kg_rag.config import LLMConfig, Neo4jConfig, RagConfig
 from kg_rag.neo4j_store import Neo4jGraphStore
 from kg_rag.pipelines.query import QueryResult
 from kg_rag.web import app as web_app
-from kg_rag.web.app import INDEXING_JOBS, JOBS_LOCK, create_app
+from kg_rag.web.app import INDEXING_JOBS, JOBS_LOCK, FileEntry, JobState, create_app
 
 
 TEST_SESSION_ID = "test-session-12345"
@@ -108,7 +108,7 @@ def test_upload_rejects_non_pdf() -> None:
     client = TestClient(create_app(_build_config()))
     response = client.post(
         "/api/upload",
-        files={"file": ("note.txt", b"hello", "text/plain")},
+        files=[("files", ("note.txt", b"hello", "text/plain"))],
         headers=SESSION_HEADERS,
     )
     assert response.status_code == 400
@@ -119,7 +119,7 @@ def test_upload_rejects_empty_file() -> None:
     client = TestClient(create_app(_build_config()))
     response = client.post(
         "/api/upload",
-        files={"file": ("empty.pdf", b"", "application/pdf")},
+        files=[("files", ("empty.pdf", b"", "application/pdf"))],
         headers=SESSION_HEADERS,
     )
     assert response.status_code == 400
@@ -250,14 +250,14 @@ def test_upload_returns_job_id_and_202(monkeypatch) -> None:
     client = TestClient(create_app(_build_config()))
     response = client.post(
         "/api/upload",
-        files={"file": ("doc.pdf", b"%PDF-1.4 fake bytes", "application/pdf")},
+        files=[("files", ("doc.pdf", b"%PDF-1.4 fake bytes", "application/pdf"))],
         headers=SESSION_HEADERS,
     )
 
     assert response.status_code == 202
     body = response.json()
     assert body["status"] == "queued"
-    assert body["filename"] == "doc.pdf"
+    assert body["files"][0]["filename"] == "doc.pdf"
     assert isinstance(body["job_id"], str) and len(body["job_id"]) > 16
     assert body["estimated_seconds"] >= 30
     assert len(submitted) == 1
@@ -269,6 +269,49 @@ def test_upload_returns_job_id_and_202(monkeypatch) -> None:
     assert state.tmp_dir is not None and state.tmp_dir.exists()
 
 
+def test_upload_accepts_multiple_files(monkeypatch) -> None:
+    _clear_jobs()
+    submitted: list = []
+
+    class FakeFuture:
+        def __init__(self) -> None:
+            self.cancelled_flag = False
+
+    monkeypatch.setattr(web_app.JOB_EXECUTOR, "submit", lambda fn, *a, **k: (submitted.append(a) or FakeFuture()))
+
+    client = TestClient(create_app(_build_config()))
+    response = client.post(
+        "/api/upload",
+        files=[
+            ("files", ("a.pdf", b"%PDF-1.4 first", "application/pdf")),
+            ("files", ("b.pdf", b"%PDF-1.4 second", "application/pdf")),
+        ],
+        headers=SESSION_HEADERS,
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert len(body["files"]) == 2
+    assert body["files"][0]["filename"] == "a.pdf"
+    assert body["files"][1]["filename"] == "b.pdf"
+    assert len(submitted) == 1  # one batch job
+
+
+def test_upload_rejects_non_pdf_in_batch(monkeypatch) -> None:
+    _clear_jobs()
+    client = TestClient(create_app(_build_config()))
+    response = client.post(
+        "/api/upload",
+        files=[
+            ("files", ("good.pdf", b"%PDF-1.4", "application/pdf")),
+            ("files", ("bad.txt", b"hello", "text/plain")),
+        ],
+        headers=SESSION_HEADERS,
+    )
+    assert response.status_code == 400
+    assert "PDF" in response.json()["detail"]
+
+
 def test_jobs_endpoint_returns_state(monkeypatch) -> None:
     _clear_jobs()
     monkeypatch.setattr(web_app.JOB_EXECUTOR, "submit", lambda *a, **k: None)
@@ -276,7 +319,7 @@ def test_jobs_endpoint_returns_state(monkeypatch) -> None:
     client = TestClient(create_app(_build_config()))
     upload_response = client.post(
         "/api/upload",
-        files={"file": ("doc.pdf", b"%PDF-1.4 fake bytes", "application/pdf")},
+        files=[("files", ("doc.pdf", b"%PDF-1.4 fake bytes", "application/pdf"))],
         headers=SESSION_HEADERS,
     )
     job_id = upload_response.json()["job_id"]
@@ -286,8 +329,30 @@ def test_jobs_endpoint_returns_state(monkeypatch) -> None:
     body = response.json()
     assert body["job_id"] == job_id
     assert body["status"] == "queued"
-    assert body["filename"] == "doc.pdf"
+    assert body["files"][0]["filename"] == "doc.pdf"
     assert body["graph"] is None
+
+
+def test_jobs_endpoint_returns_per_file_status(monkeypatch) -> None:
+    _clear_jobs()
+    job_id = "cafebabe12345678cafebabe12345678"
+    with JOBS_LOCK:
+        INDEXING_JOBS[job_id] = JobState(
+            id=job_id,
+            session_id=TEST_SESSION_ID,
+            files=[
+                FileEntry(filename="a.pdf", document_id="aaa", status="done"),
+                FileEntry(filename="b.pdf", document_id="bbb", status="indexing"),
+            ],
+            status="running",
+        )
+
+    client = TestClient(create_app(_build_config()))
+    response = client.get(f"/api/jobs/{job_id}", headers=SESSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["files"][0] == {"filename": "a.pdf", "document_id": "aaa", "status": "done", "error": None}
+    assert body["files"][1]["status"] == "indexing"
 
 
 def test_jobs_endpoint_returns_404_for_unknown_id() -> None:
@@ -304,7 +369,7 @@ def test_jobs_endpoint_isolates_by_session(monkeypatch) -> None:
     client = TestClient(create_app(_build_config()))
     upload_response = client.post(
         "/api/upload",
-        files={"file": ("doc.pdf", b"%PDF-1.4 fake bytes", "application/pdf")},
+        files=[("files", ("doc.pdf", b"%PDF-1.4 fake bytes", "application/pdf"))],
         headers=SESSION_HEADERS,
     )
     job_id = upload_response.json()["job_id"]
@@ -332,7 +397,7 @@ def test_run_indexing_job_marks_done_on_success(monkeypatch, tmp_path) -> None:
         def __init__(self, config) -> None:
             self.store = FakeStore()
 
-        def run(self, paths, *, session_id, progress):
+        def run(self, paths, *, session_id, progress, on_file=None):
             progress("parsing", 0, 0)
             progress("extracting", 0, 2)
             progress("extracting", 2, 2)
@@ -346,18 +411,17 @@ def test_run_indexing_job_marks_done_on_success(monkeypatch, tmp_path) -> None:
     pdf_path = tmp_path / "doc.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
     job_id = "abc1234567890def1234567890123456"
-    from kg_rag.web.app import JobState
 
     with JOBS_LOCK:
         INDEXING_JOBS[job_id] = JobState(
             id=job_id,
             session_id=TEST_SESSION_ID,
-            filename="doc.pdf",
+            files=[FileEntry(filename="doc.pdf", document_id="")],
             status="queued",
             tmp_dir=tmp_path,
         )
 
-    web_app._run_indexing_job(job_id, pdf_path, _build_config())
+    web_app._run_indexing_job(job_id, [pdf_path], _build_config())
 
     with JOBS_LOCK:
         state = INDEXING_JOBS[job_id]
@@ -374,7 +438,7 @@ def test_run_indexing_job_marks_error_on_failure(monkeypatch, tmp_path) -> None:
         def __init__(self, config) -> None:
             self.store = type("S", (), {"close": lambda self: None})()
 
-        def run(self, paths, *, session_id, progress):
+        def run(self, paths, *, session_id, progress, on_file=None):
             raise RuntimeError("boom")
 
     monkeypatch.setattr(web_app, "IndexingPipeline", BrokenPipeline)
@@ -382,18 +446,17 @@ def test_run_indexing_job_marks_error_on_failure(monkeypatch, tmp_path) -> None:
     pdf_path = tmp_path / "doc.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
     job_id = "def1234567890abc1234567890123456"
-    from kg_rag.web.app import JobState
 
     with JOBS_LOCK:
         INDEXING_JOBS[job_id] = JobState(
             id=job_id,
             session_id=TEST_SESSION_ID,
-            filename="doc.pdf",
+            files=[FileEntry(filename="doc.pdf", document_id="")],
             status="queued",
             tmp_dir=tmp_path,
         )
 
-    web_app._run_indexing_job(job_id, pdf_path, _build_config())
+    web_app._run_indexing_job(job_id, [pdf_path], _build_config())
 
     with JOBS_LOCK:
         state = INDEXING_JOBS[job_id]
@@ -447,7 +510,7 @@ def test_document_text_endpoint_returns_pages(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setattr(
         "kg_rag.web.app._extract_pdf_pages",
-        lambda path: [{"page_number": 1, "text": "Seite eins"}, {"page_number": 2, "text": "Seite zwei"}],
+        lambda path, **_: [{"page_number": 1, "text": "Seite eins"}, {"page_number": 2, "text": "Seite zwei"}],
     )
 
     client = TestClient(create_app(_build_config()))

@@ -37,6 +37,7 @@ from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore, stable_id
 
 
 ProgressCallback = Callable[[str, int, int], None]
+FileCallback = Callable[[str, str], None]
 
 
 SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf"}
@@ -67,10 +68,15 @@ class IndexingPipeline:
         overwrite: bool = False,
         session_id: str = DEFAULT_SESSION_ID,
         progress: ProgressCallback | None = None,
+        on_file: FileCallback | None = None,
     ) -> int:
         def emit(step: str, current: int = 0, total: int = 0) -> None:
             if progress is not None:
                 progress(step, current, total)
+
+        def emit_file(doc_id: str, status: str) -> None:
+            if on_file is not None:
+                on_file(doc_id, status)
 
         files = collect_supported_files(paths)
         logger.info(f"Indexing {len(files)} file(s) for session {session_id}")
@@ -78,6 +84,12 @@ class IndexingPipeline:
             emit("done", 0, 0)
             return 0
 
+        # Compute document_ids upfront — same formula as _source_metadata, which
+        # uses already-resolved paths (collect_supported_files resolves them).
+        file_doc_ids = [stable_id(f"{session_id}|{str(f)}") for f in files]
+
+        for doc_id in file_doc_ids:
+            emit_file(doc_id, "parsing")
         emit("parsing")
         documents = load_documents(
             files,
@@ -85,6 +97,8 @@ class IndexingPipeline:
             ocr_enabled=self.config.ocr_enabled,
             ocr_language=self.config.ocr_language,
         )
+        for doc_id in file_doc_ids:
+            emit_file(doc_id, "indexing")
 
         emit("splitting")
         chunks = split_documents(
@@ -125,6 +139,8 @@ class IndexingPipeline:
             {doc_id: list(valid_ids) for doc_id, valid_ids in valid_chunks_by_doc.items()},
             session_id=session_id,
         )
+        for doc_id in valid_chunks_by_doc:
+            emit_file(doc_id, "done")
 
         # Persist embedding model metadata so the query pipeline can detect
         # model drift after the index has been built.

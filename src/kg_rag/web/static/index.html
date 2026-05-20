@@ -144,6 +144,7 @@
     .file-list li:first-child { border-top: none; }
     .file-list .ok { color: #4ea860; flex-shrink: 0; }
     .file-list .err { color: #e25c5c; flex-shrink: 0; }
+    .file-list .pending { color: #c9a227; flex-shrink: 0; }
     .file-list .name { word-break: break-all; }
     .file-list .meta { color: #4a5160; font-size: 11px; }
     .file-list .del { margin-left: auto; background: none; border: none; padding: 0; color: #3a4050; cursor: pointer; line-height: 1; flex-shrink: 0; display: flex; align-items: center; opacity: 0; transition: opacity 0.15s, color 0.15s; }
@@ -423,10 +424,10 @@
   <main>
     <aside>
       <div id="drop-area">
-        <div>PDF hierhin ziehen</div>
+        <div>PDFs hierhin ziehen</div>
         <div class="hint">oder klicken zum Auswählen</div>
       </div>
-      <input type="file" id="file-input" accept="application/pdf" hidden />
+      <input type="file" id="file-input" accept="application/pdf" multiple hidden />
       <div id="progress">
         <div class="bar"><div class="fill"></div></div>
         <div class="label"></div>
@@ -870,6 +871,60 @@
     const progressFill = progressEl.querySelector('.fill');
     const progressLabel = progressEl.querySelector('.label');
     let activePoll = null;
+    const pendingFileEntries = new Map(); // documentId → <li> element
+
+    function addFilePendingEntry(filename, documentId) {
+      const li = document.createElement('li');
+      li.dataset.documentId = documentId;
+      const badge = document.createElement('span');
+      badge.className = 'pending';
+      badge.textContent = '·';
+      const nameEl = document.createElement('span');
+      nameEl.className = 'name';
+      nameEl.textContent = filename;
+      const metaEl = document.createElement('span');
+      metaEl.className = 'meta';
+      metaEl.textContent = 'eingereiht';
+      li.append(badge, nameEl, metaEl);
+      pendingFileEntries.set(documentId, li);
+      return li;
+    }
+
+    const FILE_STATUS_LABELS = {
+      queued: 'eingereiht',
+      parsing: 'wird gelesen …',
+      indexing: 'wird verarbeitet …',
+      done: 'fertig',
+    };
+
+    function updateFilePendingEntry(documentId, status, errorMsg) {
+      const li = pendingFileEntries.get(documentId);
+      if (!li) return;
+      const badge = li.querySelector('span:first-child');
+      const metaEl = li.querySelector('.meta');
+      if (status === 'done') {
+        badge.className = 'ok';
+        badge.textContent = '✓';
+        if (metaEl) metaEl.textContent = 'fertig';
+        if (!li.querySelector('.del')) {
+          const delBtn = document.createElement('button');
+          delBtn.className = 'del';
+          delBtn.title = 'Aus Kontext entfernen';
+          delBtn.innerHTML = '<svg width="11" height="12" viewBox="0 0 11 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 3h9M4 3V2h3v1M2 3l.7 7.5h5.6L9 3"/></svg>';
+          li.append(delBtn);
+        }
+        pendingFileEntries.delete(documentId);
+      } else if (status === 'error') {
+        badge.className = 'err';
+        badge.textContent = '✕';
+        if (metaEl) metaEl.textContent = errorMsg || 'Fehler';
+        pendingFileEntries.delete(documentId);
+      } else {
+        badge.className = 'pending';
+        badge.textContent = '·';
+        if (metaEl) metaEl.textContent = FILE_STATUS_LABELS[status] || status;
+      }
+    }
 
     function showProgress(step, current, total) {
       progressEl.classList.add('visible');
@@ -891,8 +946,11 @@
       progressLabel.textContent = '';
     }
 
-    async function upload(file) {
-      if (!file.name.toLowerCase().endsWith('.pdf')) {
+    async function upload(fileList) {
+      const files = Array.from(fileList);
+      if (files.length === 0) return;
+      const nonPdfs = files.filter(f => !f.name.toLowerCase().endsWith('.pdf'));
+      if (nonPdfs.length > 0) {
         setStatus('Nur PDF-Dateien erlaubt', 'error');
         return;
       }
@@ -901,9 +959,9 @@
         activePoll = null;
       }
       const fd = new FormData();
-      fd.append('file', file);
+      for (const f of files) fd.append('files', f);
       dropArea.classList.add('busy');
-      setStatus(`Lade ${file.name} hoch …`, 'busy');
+      setStatus(`Lade ${files.length} PDF${files.length > 1 ? 's' : ''} hoch …`, 'busy');
       showProgress('queued', 0, 0);
       let job;
       try {
@@ -916,26 +974,31 @@
         if (!res.ok) {
           hideProgress();
           dropArea.classList.remove('busy');
-          addFileEntry(file.name, job.detail || res.statusText, false);
+          for (let i = files.length - 1; i >= 0; i--) addFileEntry(files[i].name, job.detail || res.statusText, false);
           setStatus(`Fehler: ${job.detail || res.statusText}`, 'error');
           return;
         }
       } catch (err) {
         hideProgress();
         dropArea.classList.remove('busy');
-        addFileEntry(file.name, err.message, false);
+        for (let i = files.length - 1; i >= 0; i--) addFileEntry(files[i].name, err.message, false);
         setStatus(`Fehler: ${err.message}`, 'error');
         return;
       }
-      if (job.document_id) textViewer.registerDoc(job.document_id, job.filename);
-      pollJob(job.job_id, job.filename, job.estimated_seconds || 120);
+      const frag = document.createDocumentFragment();
+      for (const f of job.files) {
+        textViewer.registerDoc(f.document_id, f.filename);
+        frag.appendChild(addFilePendingEntry(f.filename, f.document_id));
+      }
+      filesEl.prepend(frag);
+      pollJob(job.job_id, job.estimated_seconds || 120);
     }
 
-    function pollJob(jobId, filename, etaSec) {
+    function pollJob(jobId, etaSec) {
       const intervalMs = 700;
       const hardCapMs = Math.max(etaSec * 1500, 15 * 60 * 1000); // mind. 15 Min Puffer
       const startedAt = Date.now();
-      setStatus(`${filename} wird indexiert …`, 'busy');
+      setStatus('Indexierung läuft …', 'busy');
 
       const tick = async () => {
         if (Date.now() - startedAt > hardCapMs) {
@@ -943,7 +1006,7 @@
           activePoll = null;
           hideProgress();
           dropArea.classList.remove('busy');
-          addFileEntry(filename, 'Job-Zeitlimit überschritten', false);
+          pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'error', 'Zeitlimit überschritten'));
           setStatus('Job läuft länger als erwartet, prüfe Logs', 'error');
           return;
         }
@@ -955,26 +1018,29 @@
             activePoll = null;
             hideProgress();
             dropArea.classList.remove('busy');
-            addFileEntry(filename, data.detail || res.statusText, false);
+            pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'error', data.detail || res.statusText));
             setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
             return;
           }
           showProgress(data.step, data.current || 0, data.total || 0);
+          if (Array.isArray(data.files)) {
+            for (const f of data.files) updateFilePendingEntry(f.document_id, f.status, f.error);
+          }
           if (data.status === 'done') {
             clearInterval(activePoll);
             activePoll = null;
             hideProgress();
             dropArea.classList.remove('busy');
-            addFileEntry(filename, `${data.chunks_indexed} Chunks`, true, data.document_id);
+            // Finalize any entries not yet marked done by on_file callbacks
+            pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'done'));
             if (data.graph) renderGraph(data.graph);
-            if (data.document_id) textViewer.registerDoc(data.document_id, filename);
             setStatus(data.graph ? graphSummary(data.graph) : 'Fertig');
           } else if (data.status === 'error') {
             clearInterval(activePoll);
             activePoll = null;
             hideProgress();
             dropArea.classList.remove('busy');
-            addFileEntry(filename, data.error || 'Indexierung fehlgeschlagen', false);
+            pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'error', data.error || 'Indexierung fehlgeschlagen'));
             setStatus(`Fehler: ${data.error || 'Indexierung fehlgeschlagen'}`, 'error');
           }
         } catch (err) {
@@ -1231,8 +1297,7 @@
 
     dropArea.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', e => {
-      const f = e.target.files[0];
-      if (f) upload(f);
+      if (e.target.files.length > 0) upload(e.target.files);
       fileInput.value = '';
     });
 
@@ -1251,8 +1316,7 @@
       });
     });
     dropArea.addEventListener('drop', e => {
-      const f = e.dataTransfer.files[0];
-      if (f) upload(f);
+      if (e.dataTransfer.files.length > 0) upload(e.dataTransfer.files);
     });
     document.addEventListener('dragover', e => e.preventDefault());
     document.addEventListener('drop', e => e.preventDefault());

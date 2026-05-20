@@ -55,12 +55,19 @@ class SessionEndRequest(BaseModel):
 
 
 @dataclass
+class FileEntry:
+    filename: str
+    document_id: str
+    status: Literal["queued", "parsing", "indexing", "done", "error"] = "queued"
+    error: str | None = None
+
+
+@dataclass
 class JobState:
     id: str
     session_id: str
-    filename: str
+    files: list[FileEntry]
     status: JOB_STATUS
-    document_id: str = ""
     step: str = "queued"
     current: int = 0
     total: int = 0
@@ -76,8 +83,10 @@ class JobState:
     def snapshot(self) -> dict[str, Any]:
         return {
             "job_id": self.id,
-            "filename": self.filename,
-            "document_id": self.document_id,
+            "files": [
+                {"filename": f.filename, "document_id": f.document_id, "status": f.status, "error": f.error}
+                for f in self.files
+            ],
             "status": self.status,
             "step": self.step,
             "current": self.current,
@@ -93,6 +102,7 @@ class JobState:
 
 INDEXING_JOBS: dict[str, JobState] = {}
 JOBS_LOCK = threading.Lock()
+MANIFEST_LOCK = threading.Lock()
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="indexing-job")
 
 _PDF_PAGES_CACHE: dict[str, list[dict[str, Any]]] = {}
@@ -159,11 +169,11 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
 
     @app.post("/api/upload", status_code=202)
     async def upload(
-        file: UploadFile = File(...),
+        files: list[UploadFile] = File(...),
         x_session_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
         session_id = _require_session_id(x_session_id)
-        return await _enqueue_upload(file, app_config, session_id)
+        return await _enqueue_upload(files, app_config, session_id)
 
     @app.get("/api/document/{document_id}/text")
     def document_text(
@@ -318,56 +328,70 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
     return app
 
 
-async def _enqueue_upload(file: UploadFile, config: RagConfig, session_id: str) -> dict[str, Any]:
-    filename = file.filename or ""
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Nur PDF-Dateien werden akzeptiert")
+async def _enqueue_upload(upload_files: list[UploadFile], config: RagConfig, session_id: str) -> dict[str, Any]:
+    # Validate and read all files first — reject the whole batch if any file fails.
+    validated: list[tuple[str, bytes]] = []
+    seen_names: set[str] = set()
+    for uf in upload_files:
+        filename = uf.filename or ""
+        if not filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"Nur PDF-Dateien werden akzeptiert: {filename}")
+        contents = await uf.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail=f"Datei ist leer: {filename}")
+        if len(contents) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"Datei zu groß (max. 50 MB): {filename}")
+        safe_name = Path(filename).name or "upload.pdf"
+        if safe_name in seen_names:
+            raise HTTPException(status_code=400, detail=f"Doppelter Dateiname im Upload: {safe_name}")
+        seen_names.add(safe_name)
+        validated.append((safe_name, contents))
 
-    contents = await file.read()
-    if not contents:
-        raise HTTPException(status_code=400, detail="Datei ist leer")
-    if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Datei zu groß (max. 50 MB)")
-
-    safe_name = Path(filename).name or "upload.pdf"
     session_dir = UPLOADS_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = session_dir / safe_name
-    pdf_path.write_bytes(contents)
-    resolved_source = str(pdf_path.resolve())
-    document_id = stable_id(f"{session_id}|{resolved_source}")
-    _record_pdf_manifest(session_id, document_id, safe_name)
+
+    file_entries: list[FileEntry] = []
+    pdf_paths: list[Path] = []
+    manifest_entries: list[tuple[str, str]] = []
+    estimated_total = 0
+
+    for safe_name, contents in validated:
+        pdf_path = session_dir / safe_name
+        pdf_path.write_bytes(contents)
+        document_id = stable_id(f"{session_id}|{str(pdf_path.resolve())}")
+        file_entries.append(FileEntry(filename=safe_name, document_id=document_id, status="queued"))
+        pdf_paths.append(pdf_path)
+        manifest_entries.append((document_id, safe_name))
+        estimated_total += _estimate_seconds(len(contents))
+
+    _record_pdf_manifest(session_id, manifest_entries)
 
     job_id = uuid.uuid4().hex
-    estimated = _estimate_seconds(len(contents))
-
     state = JobState(
         id=job_id,
         session_id=session_id,
-        filename=safe_name,
-        document_id=document_id,
+        files=file_entries,
         status="queued",
         step="queued",
-        estimated_seconds=estimated,
+        estimated_seconds=estimated_total,
         tmp_dir=session_dir,
     )
     with JOBS_LOCK:
         _evict_old_jobs(time.time())
         INDEXING_JOBS[job_id] = state
 
-    future = JOB_EXECUTOR.submit(_run_indexing_job, job_id, pdf_path, config)
+    future = JOB_EXECUTOR.submit(_run_indexing_job, job_id, pdf_paths, config)
     state.future = future
 
     return {
         "job_id": job_id,
-        "filename": safe_name,
-        "document_id": document_id,
+        "files": [{"filename": e.filename, "document_id": e.document_id} for e in file_entries],
         "status": "queued",
-        "estimated_seconds": estimated,
+        "estimated_seconds": estimated_total,
     }
 
 
-def _run_indexing_job(job_id: str, pdf_path: Path, config: RagConfig) -> None:
+def _run_indexing_job(job_id: str, pdf_paths: list[Path], config: RagConfig) -> None:
     with JOBS_LOCK:
         state = INDEXING_JOBS.get(job_id)
         if state is None:
@@ -379,16 +403,39 @@ def _run_indexing_job(job_id: str, pdf_path: Path, config: RagConfig) -> None:
     def progress(step: str, current: int, total: int) -> None:
         _update_job(job_id, step=step, current=current, total=total)
 
+    def on_file(document_id: str, status: str) -> None:
+        with JOBS_LOCK:
+            s = INDEXING_JOBS.get(job_id)
+            if s is None:
+                return
+            for entry in s.files:
+                if entry.document_id == document_id:
+                    entry.status = status
+                    break
+
     pipeline = IndexingPipeline(config)
     try:
         chunk_count = pipeline.run(
-            [pdf_path],
+            pdf_paths,
             session_id=session_id,
             progress=progress,
+            on_file=on_file,
         )
         _purge_orphan_chunks(config, session_id)
         invalidate_embedding_meta(session_id)
         graph_data = _fetch_graph_unsafe(config, session_id)
+        with JOBS_LOCK:
+            doc_id_to_path = {
+                e.document_id: p
+                for e, p in zip(INDEXING_JOBS[job_id].files, pdf_paths)
+            } if job_id in INDEXING_JOBS else {}
+        for doc_id, pdf_path in doc_id_to_path.items():
+            threading.Thread(
+                target=_precache_pdf_pages,
+                args=(doc_id, pdf_path, config.ocr_language),
+                name=f"pdf-precache-{doc_id[:8]}",
+                daemon=True,
+            ).start()
         _update_job(
             job_id,
             status="done",
@@ -401,6 +448,13 @@ def _run_indexing_job(job_id: str, pdf_path: Path, config: RagConfig) -> None:
         )
     except Exception as exc:
         logger.exception("Indexing job %s failed", job_id)
+        with JOBS_LOCK:
+            s = INDEXING_JOBS.get(job_id)
+            if s:
+                for entry in s.files:
+                    if entry.status != "done":
+                        entry.status = "error"
+                        entry.error = str(exc)[:200]
         _update_job(
             job_id,
             status="error",
@@ -419,17 +473,19 @@ def _manifest_path(session_id: str) -> Path:
     return UPLOADS_DIR / session_id / "index.json"
 
 
-def _record_pdf_manifest(session_id: str, document_id: str, filename: str) -> None:
+def _record_pdf_manifest(session_id: str, entries: list[tuple[str, str]]) -> None:
     path = _manifest_path(session_id)
-    try:
-        manifest: dict[str, str] = json.loads(path.read_text("utf-8")) if path.exists() else {}
-    except Exception:
-        manifest = {}
-    manifest[document_id] = filename
-    try:
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-    except Exception:
-        logger.exception("Failed to write PDF manifest for session %s", session_id)
+    with MANIFEST_LOCK:
+        try:
+            manifest: dict[str, str] = json.loads(path.read_text("utf-8")) if path.exists() else {}
+        except Exception:
+            manifest = {}
+        for document_id, filename in entries:
+            manifest[document_id] = filename
+        try:
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to write PDF manifest for session %s", session_id)
 
 
 def _resolve_pdf_file(session_id: str, document_id: str) -> Path | None:
@@ -457,22 +513,29 @@ def _resolve_pdf_file(session_id: str, document_id: str) -> Path | None:
 
 def _remove_pdf_manifest(session_id: str, document_id: str) -> None:
     path = _manifest_path(session_id)
-    try:
-        manifest: dict[str, str] = json.loads(path.read_text("utf-8")) if path.exists() else {}
-    except Exception:
-        manifest = {}
-    filename = manifest.pop(document_id, None)
-    if filename:
-        pdf_path = _resolve_pdf_file(session_id, document_id)
-        if pdf_path is not None:
+    pdf_filename: str | None = None
+    with MANIFEST_LOCK:
+        try:
+            manifest: dict[str, str] = json.loads(path.read_text("utf-8")) if path.exists() else {}
+        except Exception:
+            manifest = {}
+        pdf_filename = manifest.pop(document_id, None)
+        try:
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to update PDF manifest for session %s", session_id)
+    # Delete the file outside the lock to avoid holding it during I/O.
+    if pdf_filename:
+        session_dir = UPLOADS_DIR / session_id
+        if "/" not in pdf_filename and "\\" not in pdf_filename and not pdf_filename.startswith(".."):
+            candidate = (session_dir / pdf_filename).resolve()
             try:
-                pdf_path.unlink(missing_ok=True)
+                candidate.relative_to(session_dir.resolve())
+                candidate.unlink(missing_ok=True)
+            except ValueError:
+                pass
             except Exception:
                 logger.exception("Failed to delete PDF file for document %s", document_id)
-    try:
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-    except Exception:
-        logger.exception("Failed to update PDF manifest for session %s", session_id)
 
 
 def _warmup_pdf_libs() -> None:
@@ -488,6 +551,16 @@ def _warmup_pdf_libs() -> None:
         import pytesseract  # noqa: F401
     except Exception:
         pass
+
+
+def _precache_pdf_pages(document_id: str, path: Path, ocr_language: str) -> None:
+    try:
+        pages = _extract_pdf_pages(path, ocr_language=ocr_language)
+        with _PDF_PAGES_CACHE_LOCK:
+            _PDF_PAGES_CACHE[document_id] = pages
+        logger.info("PDF-Seiten vorgeladen für Dokument %s (%d Seiten)", document_id[:8], len(pages))
+    except Exception:
+        logger.exception("PDF-Vorladen fehlgeschlagen für Dokument %s", document_id[:8])
 
 
 def _extract_pdf_pages(path: Path, ocr_language: str = "deu+eng") -> list[dict[str, Any]]:

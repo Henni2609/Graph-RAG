@@ -109,3 +109,41 @@ def test_indexing_pipeline_no_files_emits_done(tmp_path: Path) -> None:
 
     assert count == 0
     assert events == [("done", 0, 0)]
+
+
+def test_indexing_pipeline_invokes_on_file_callback(monkeypatch, tmp_path: Path) -> None:
+    pdf1 = tmp_path / "a.pdf"
+    pdf2 = tmp_path / "b.pdf"
+    pdf1.write_bytes(b"%PDF-1.4 a")
+    pdf2.write_bytes(b"%PDF-1.4 b")
+
+    monkeypatch.setattr(
+        indexing_mod,
+        "load_documents",
+        lambda files, *, session_id="default", **_: [
+            make_document("text", meta={"source": str(f), "title": f.name, "session_id": session_id})
+            for f in files
+        ],
+    )
+    monkeypatch.setattr(
+        indexing_mod,
+        "split_documents",
+        lambda docs, **_: [
+            make_document(f"chunk-{i}", meta={"source": str(pdf1), "title": pdf1.name, "chunk_index": i})
+            for i in range(2)
+        ],
+    )
+    monkeypatch.setattr(indexing_mod, "embed_documents", lambda docs, **_: docs)
+
+    file_events: list[tuple[str, str]] = []
+    pipeline = IndexingPipeline(_build_config(), store=_NoopStore(), entity_extractor=_NoopExtractor())
+    pipeline.run([pdf1, pdf2], on_file=lambda doc_id, status: file_events.append((doc_id, status)))
+
+    statuses_by_doc: dict[str, list[str]] = {}
+    for doc_id, status in file_events:
+        statuses_by_doc.setdefault(doc_id, []).append(status)
+
+    assert len(statuses_by_doc) == 2
+    for statuses in statuses_by_doc.values():
+        assert statuses[0] == "parsing"
+        assert statuses[1] == "indexing"
