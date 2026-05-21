@@ -9,13 +9,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from kg_rag.compat import Document, document_meta
-from kg_rag.components.context_merger import ContextMerger
+from kg_rag.components.bm25_retriever import BM25Retriever
+from kg_rag.components.context_merger import ContextMerger, chunk_key
 from kg_rag.components.entity_extractor import parse_extraction_response
 from kg_rag.components.graph_retriever import GraphRetriever
+from kg_rag.components.reranker import CrossEncoderReranker
 from kg_rag.config import RagConfig
 from kg_rag.llm import create_chat_generator, run_chat
 from kg_rag.logging import log_timing, logger
 from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore
+from kg_rag.pipelines.indexing import _resolve_device
 
 
 # Note: the UI renders [S1] tags as "Q1", "Q2" etc. (see decorateCitations in index.html).
@@ -51,6 +54,40 @@ Antworte ausschliesslich mit JSON:
 
 def _filter_by_similarity(docs: list[Document], threshold: float) -> list[Document]:
     return [d for d in docs if getattr(d, "score", None) is None or d.score >= threshold]
+
+
+def _reciprocal_rank_fusion(ranked_lists: list[list[Document]], *, k: int = 60) -> list[Document]:
+    """Combine multiple ranked lists via Reciprocal Rank Fusion (score = Σ 1/(k + rank))."""
+    scores: dict[str, float] = {}
+    all_docs: dict[str, Document] = {}
+    for ranked in ranked_lists:
+        for rank, doc in enumerate(ranked, start=1):
+            key = chunk_key(doc)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            if key not in all_docs:
+                all_docs[key] = doc
+    result = []
+    for key in sorted(all_docs, key=lambda k_: -scores[k_]):
+        doc = all_docs[key]
+        try:
+            doc.score = scores[key]
+        except AttributeError:
+            pass
+        result.append(doc)
+    return result
+
+
+def _per_doc_limit(docs: list[Document], limit: int) -> list[Document]:
+    """Keep at most `limit` chunks per document (preserves input order)."""
+    counts: dict[str, int] = {}
+    result = []
+    for doc in docs:
+        doc_id = str(document_meta(doc).get("document_id") or "")
+        if counts.get(doc_id, 0) >= limit:
+            continue
+        counts[doc_id] = counts.get(doc_id, 0) + 1
+        result.append(doc)
+    return result
 
 
 # Maps lowercase query substrings to the English section-title keyword to search for.
@@ -106,6 +143,7 @@ _embedding_meta_lock = threading.Lock()
 def invalidate_embedding_meta(session_id: str) -> None:
     with _embedding_meta_lock:
         _embedding_meta_cache.pop(session_id, None)
+    BM25Retriever.invalidate(session_id)
 
 
 @dataclass
@@ -144,7 +182,16 @@ class QueryPipeline:
         self.store = store or Neo4jGraphStore(config.neo4j)
         self.generator = generator
         self._extraction_gen: Any | None = None
-        self.merger = merger or ContextMerger(max_context_chars=config.max_context_chars)
+        self.merger = merger or ContextMerger(
+            max_context_chars=config.max_context_chars,
+            max_context_tokens=config.max_context_tokens,
+        )
+        self.reranker = (
+            CrossEncoderReranker(model=config.reranker_model, top_k=config.reranker_top_k, device=_resolve_device(config.embedding_device))
+            if config.reranker_enabled
+            else None
+        )
+        self.bm25 = BM25Retriever(store=self.store) if config.bm25_enabled else None
         self.graph_retriever = GraphRetriever(
             store=self.store,
             hops=config.graph_hops,
@@ -170,7 +217,8 @@ class QueryPipeline:
 
         section_keywords = _extract_section_keywords(question)
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        _top_k = top_k if top_k is not None else self.config.query_top_k
+        with ThreadPoolExecutor(max_workers=3) as pool:
             entity_future = pool.submit(
                 self.extract_query_entities, question, generator=extraction_gen
             )
@@ -183,12 +231,18 @@ class QueryPipeline:
                 )
             else:
                 section_future = None
+            if self.bm25 is not None:
+                bm25_future = pool.submit(
+                    self.bm25.search, question, session_id=session_id, top_k=_top_k
+                )
+            else:
+                bm25_future = None
 
             with log_timing("vector_search"):
                 try:
                     vector_documents = self.store.vector_search(
                         query_embedding,
-                        top_k=top_k if top_k is not None else self.config.query_top_k,
+                        top_k=_top_k,
                         session_id=session_id,
                     )
                 except Exception as exc:
@@ -208,6 +262,17 @@ class QueryPipeline:
 
         vector_documents = _filter_by_similarity(vector_documents, self.config.min_similarity)
 
+        # BM25 + RRF fusion — runs after similarity filter so score scales don't conflict.
+        if bm25_future is not None:
+            try:
+                with log_timing("bm25_wait"):
+                    bm25_docs = bm25_future.result()
+                if bm25_docs:
+                    with log_timing("rrf_fusion"):
+                        vector_documents = _reciprocal_rank_fusion([vector_documents, bm25_docs])
+            except Exception as exc:
+                logger.warning(f"BM25 search failed: {exc}")
+
         # Section-matched docs bypass the similarity threshold — they are retrieved
         # by structural match (section_title CONTAINS keyword), not cosine distance.
         if section_future is not None:
@@ -216,6 +281,10 @@ class QueryPipeline:
                 seen_ids = {str(document_meta(d).get("chunk_id")) for d in vector_documents}
                 for doc in section_docs:
                     if str(document_meta(doc).get("chunk_id")) not in seen_ids:
+                        m = document_meta(doc)
+                        m["bypass_rerank"] = True
+                        if hasattr(doc, "meta"):
+                            doc.meta = m
                         vector_documents.insert(0, doc)
             except Exception as exc:
                 logger.warning(f"Section title search failed: {exc}")
@@ -241,6 +310,21 @@ class QueryPipeline:
 
         graph_documents = _filter_by_similarity(graph_result["documents"], self.config.min_similarity)
         entity_context = graph_result["entity_context"]
+
+        # Re-rank combined pool and apply per-document chunk limit.
+        # Section-matched docs (bypass_rerank=True) skip the cross-encoder and are
+        # prepended with their original priority intact.
+        if self.reranker is not None:
+            all_docs = vector_documents + graph_documents
+            if all_docs:
+                bypass = [d for d in all_docs if document_meta(d).get("bypass_rerank")]
+                to_rank = [d for d in all_docs if not document_meta(d).get("bypass_rerank")]
+                with log_timing("rerank"):
+                    ranked = self.reranker.rerank(question, to_rank) if to_rank else []
+                all_docs = bypass + ranked
+                all_docs = _per_doc_limit(all_docs, self.config.per_doc_chunk_limit)
+                vector_documents = [d for d in all_docs if document_meta(d).get("retrieval_source") != "graph"]
+                graph_documents = [d for d in all_docs if document_meta(d).get("retrieval_source") == "graph"]
 
         # Only short-circuit when retrieval found literally nothing.
         # The system prompt handles the "context not sufficient" case for weak matches.

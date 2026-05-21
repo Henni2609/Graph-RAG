@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from kg_rag.config import RagConfig
 from kg_rag.llm import stream_chat_tokens
+from kg_rag.components.reranker import _get_cross_encoder
 from kg_rag.logging import logger
 from kg_rag.neo4j_store import Neo4jGraphStore, stable_id
 from kg_rag.pipelines.indexing import IndexingPipeline, _get_doc_embedder, _resolve_device
@@ -153,6 +154,13 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             daemon=True,
         ).start()
         threading.Thread(target=_warmup_pdf_libs, name="pdf-libs-warmup", daemon=True).start()
+        if app_config.reranker_enabled:
+            threading.Thread(
+                target=_get_cross_encoder,
+                args=(app_config.reranker_model, _resolve_device(app_config.embedding_device)),
+                name="reranker-warmup",
+                daemon=True,
+            ).start()
 
     @app.on_event("shutdown")
     def _shutdown_jobs() -> None:

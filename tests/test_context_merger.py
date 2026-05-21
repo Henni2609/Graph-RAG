@@ -71,21 +71,22 @@ def test_context_merger_prioritises_high_relevance_middle_chunk() -> None:
     assert [c["index"] for c in citations] == list(range(1, len(citations) + 1))
 
 
-def test_context_merger_renders_in_relevance_order() -> None:
-    """[S1] must be the highest-relevance chunk regardless of chunk_index position."""
+def test_context_merger_renders_in_document_order() -> None:
+    """Chunks from the same document must appear in chunk_index order (document coherence).
+    The most-relevant document still surfaces first when multiple documents are present."""
     low = make_document(
         "Low relevance text",
-        meta={"chunk_id": "c0", "source": "doc.pdf", "chunk_index": 0},
+        meta={"chunk_id": "c0", "source": "doc.pdf", "chunk_index": 0, "document_id": "doc1"},
         score=0.4,
     )
     high = make_document(
         "High relevance text",
-        meta={"chunk_id": "c5", "source": "doc.pdf", "chunk_index": 5},
+        meta={"chunk_id": "c5", "source": "doc.pdf", "chunk_index": 5, "document_id": "doc1"},
         score=0.9,
     )
     mid = make_document(
         "Mid relevance text",
-        meta={"chunk_id": "c3", "source": "doc.pdf", "chunk_index": 3},
+        meta={"chunk_id": "c3", "source": "doc.pdf", "chunk_index": 3, "document_id": "doc1"},
         score=0.6,
     )
     result = ContextMerger(max_context_chars=10000).run(
@@ -94,8 +95,9 @@ def test_context_merger_renders_in_relevance_order() -> None:
         entity_context="",
     )
     ctx = result["merged_context"]
-    assert ctx.index("High relevance text") < ctx.index("Mid relevance text")
-    assert ctx.index("Mid relevance text") < ctx.index("Low relevance text")
+    # Within a single document, chunks must appear in chunk_index order (0, 3, 5).
+    assert ctx.index("Low relevance text") < ctx.index("Mid relevance text")
+    assert ctx.index("Mid relevance text") < ctx.index("High relevance text")
     citations = result["citations"]
     assert [c["index"] for c in citations] == list(range(1, len(citations) + 1))
 

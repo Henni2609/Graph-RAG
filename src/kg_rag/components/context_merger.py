@@ -3,17 +3,32 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from kg_rag.compat import Document, component, document_content, document_meta
 
 _CITATION_TAG = re.compile(r"\[S(\d+)\]")
 
+try:
+    import tiktoken as _tiktoken
+    _tok = _tiktoken.get_encoding("cl100k_base")
+
+    def _count_tokens(text: str) -> int:
+        return len(_tok.encode(text))
+except ImportError:
+    def _count_tokens(text: str) -> int:  # type: ignore[misc]
+        return len(text) // 4
+
 
 @component
 class ContextMerger:
-    def __init__(self, max_context_chars: int = 6000) -> None:
+    def __init__(
+        self,
+        max_context_chars: int = 6000,
+        max_context_tokens: int | None = None,
+    ) -> None:
         self.max_context_chars = max_context_chars
+        self.max_context_tokens = max_context_tokens
 
     @component.output_types(merged_context=str, documents=list[Document], citations=list[dict])
     def run(
@@ -115,11 +130,30 @@ class ContextMerger:
             }
             records.append((pos, header_body, text, citation, retrieval_source, relevance))
 
-        entity_overhead = len(entity_section) + _SEP if entity_section else 0
-        budget = max(0, self.max_context_chars - entity_overhead)
+        if self.max_context_tokens is not None:
+            entity_overhead = (_count_tokens(entity_section) + 1) if entity_section else 0
+            budget = max(0, self.max_context_tokens - entity_overhead)
+            cost_fn: Callable[[str, str], int] = lambda h, t: _count_tokens(f"[S?] {h}\n{t}") + 1
+        else:
+            entity_overhead = len(entity_section) + _SEP if entity_section else 0
+            budget = max(0, self.max_context_chars - entity_overhead)
+            cost_fn = lambda h, t: len(h) + len(t) + _SEP
 
-        kept = _select_by_relevance(records, budget, _SEP)
-        kept.sort(key=lambda r: -(r[5] or 0.0))
+        kept = _select_by_relevance(records, budget, cost_fn)
+
+        # Sort: most-relevant document first, then by chunk position within each document.
+        # This preserves document coherence while still surfacing the best material early.
+        doc_max: dict[str, float] = {}
+        for rec in kept:
+            d = str(rec[3].get("document_id") or "")
+            s = rec[5] or 0.0
+            if d not in doc_max or s > doc_max[d]:
+                doc_max[d] = s
+
+        kept.sort(key=lambda r: (
+            -doc_max.get(str(r[3].get("document_id") or ""), 0.0),
+            r[3].get("chunk_index") if isinstance(r[3].get("chunk_index"), int) else 999999,
+        ))
 
         parts: list[str] = []
         if entity_section:
@@ -140,17 +174,16 @@ class ContextMerger:
 def _select_by_relevance(
     records: list[tuple],  # (pos, header_body, text, cit, source, relevance)
     budget: int,
-    sep: int,
+    cost_fn: Callable[[str, str], int],
 ) -> list[tuple]:
-    """Select records to fit within budget, ordered by cosine score descending."""
+    """Select records greedily by relevance score to fit within budget."""
     if not records:
         return []
 
-    costs = [len(hdr) + len(txt) + sep for _, hdr, txt, *_ in records]
+    costs = [cost_fn(hdr, txt) for _, hdr, txt, *_ in records]
     if sum(costs) <= budget:
         return records
 
-    # All chunks sorted by cosine score desc — graph chunks now have real scores too.
     all_sorted = sorted(enumerate(records), key=lambda x: -(x[1][5] or 0.0))
 
     kept_idx: set[int] = set()
@@ -162,7 +195,6 @@ def _select_by_relevance(
         kept_idx.add(i)
         used += cost
 
-    # Return in ascending position order so context mirrors document structure.
     return [records[i] for i in sorted(kept_idx)]
 
 
