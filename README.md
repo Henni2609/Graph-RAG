@@ -100,16 +100,16 @@ LLM-Schicht (Remote, OpenAI-kompatibel):
 
 ### Stack
 
-| Schicht | Technologie |
-|---|---|
-| LLM | DeepSeek API (OpenAI-kompatibel, `https://api.deepseek.com`). Standardmodell für Antworten: `deepseek-v4-pro`, für Extraktion: `deepseek-v4-flash`. Jeder OpenAI-kompatible Endpoint kann über `LLM_BASE_URL` eingesetzt werden. |
-| Embeddings | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 Dim, cosine, mehrsprachig: Deutsch + Englisch out-of-the-box) |
-| Pipeline | Haystack 2.x (`OpenAIChatGenerator` gegen DeepSeek API, `SentenceTransformersDocumentEmbedder`, `DocumentSplitter`, etc.) |
-| OCR | Tesseract (`pytesseract` + `pypdf` für Bildextraktion), Sprache konfigurierbar (`deu+eng`) |
-| Graph-DB | Neo4j 5+ |
-| Web-Backend | FastAPI + Uvicorn |
-| Frontend | Vanilla JS + `vis-network` 9.x (CDN) |
-| Sprache | Python 3.10+ |
+| Schicht     | Technologie                                                                                                                                                                                                                      |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LLM         | DeepSeek API (OpenAI-kompatibel, `https://api.deepseek.com`). Standardmodell für Antworten: `deepseek-v4-pro`, für Extraktion: `deepseek-v4-flash`. Jeder OpenAI-kompatible Endpoint kann über `LLM_BASE_URL` eingesetzt werden. |
+| Embeddings  | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 Dim, cosine, mehrsprachig: Deutsch + Englisch out-of-the-box)                                                                                                 |
+| Pipeline    | Haystack 2.x (`OpenAIChatGenerator` gegen DeepSeek API, `SentenceTransformersDocumentEmbedder`, `DocumentSplitter`, etc.)                                                                                                        |
+| OCR         | Tesseract (`pytesseract` + `pypdf` für Bildextraktion), Sprache konfigurierbar (`deu+eng`)                                                                                                                                       |
+| Graph-DB    | Neo4j 5+                                                                                                                                                                                                                         |
+| Web-Backend | FastAPI + Uvicorn                                                                                                                                                                                                                |
+| Frontend    | Vanilla JS + `vis-network` 9.x (CDN)                                                                                                                                                                                             |
+| Sprache     | Python 3.10+                                                                                                                                                                                                                     |
 
 ---
 
@@ -129,11 +129,13 @@ LLM-Schicht (Remote, OpenAI-kompatibel):
 ```
 
 **Eindeutigkeitsbeschränkungen**
+
 - `Document.id`
 - `Chunk.id`
 - `Entity.name_normalized` + `session_id` (Entitäten sind sitzungsisoliert)
 
 **Vektorindex**
+
 - `chunk_embeddings` auf `Chunk.embedding`, 384 Dimensionen, cosine-Ähnlichkeit.
 
 **Sitzungsisolierung**  
@@ -169,6 +171,7 @@ Für jeden Chunk wird das LLM mit einem strengen JSON-only Prompt aufgerufen, de
 
 **Schritt 5 — Persistieren**  
 Vier batched `UNWIND`-Cypher-Schreibvorgänge pro Indexierungslauf (nicht pro Chunk):
+
 - **Chunks-Batch**: `MERGE` Document + Chunk + `HAS_CHUNK` für ~100 Chunks auf einmal.
 - **Entitäten-Batch**: `MERGE` jede `Entity` nach `(name_normalized, session_id)` und erstellt `MENTIONS`-Kanten in einem Durchgang.
 - **Relationen-Batch**: `MERGE` `Entity-[:RELATES_TO {relation, chunk_id}]->Entity`.
@@ -188,6 +191,7 @@ Ausgelöst via `kg-rag query <Frage>`, `POST /api/query` oder `POST /api/query/s
 
 **Schritt 1 — Fragen-Entitäten & Fragen-Embedding (parallel)**  
 Gleichzeitig laufen zwei Tasks:
+
 - Das LLM extrahiert Entitätsnamen aus der Frage (JSON, gleiche Form wie beim Indexieren). Timeout: 15 s, 1 Retry.
 - `SentenceTransformersTextEmbedder` erzeugt einen 384-Dim-Query-Vektor (gecacht via `lru_cache`).
 
@@ -215,6 +219,7 @@ Das LLM wird mit dem zusammengeführten Kontext und der Frage aufgerufen. Der Sy
 
 **Streaming (`/api/query/stream`)**  
 Retrieval (Schritte 1–5) läuft blockierend in einem Thread-Pool. Sobald der Kontext fertig ist, werden die LLM-Token als SSE-Events übertragen:
+
 - `event: meta` — Metadaten (query_entities, vector_chunks, graph_chunks, citations)
 - `event: token` — Jeder Token-Delta
 - `event: final` — Vollständige, sanitierte Antwort
@@ -297,6 +302,7 @@ brew services start neo4j
 Starten/Stoppen: `brew services stop neo4j` / `brew services start neo4j`
 
 **Alternativen:**
+
 - Neo4j Desktop: https://neo4j.com/download/
 - Community ZIP von neo4j.com
 - Docker: `docker compose up -d neo4j` (siehe `docker-compose.yml`)
@@ -401,6 +407,7 @@ Rendert alle Entitäten und `RELATES_TO`-Kanten via `vis-network`. Wird nach jed
 
 **Tab „Chat"**  
 Einzel-Turn Q&A gegen das indexierte Korpus. Antworten werden als SSE-Stream Token für Token geliefert. Jede Antwort zeigt:
+
 - Zitations-Chips (`[S1]`, `[S2]` usw.) — klickbar, um den Quell-Chunk zu öffnen
 - Anzahl der Vektor-Chunks und Graph-Chunks, die den Kontext gespeist haben
 - Die Entitäten, die das LLM aus der Frage extrahiert hat
@@ -416,6 +423,7 @@ Klick auf einen Zitations-Chip öffnet das Quelldokument mit dem markierten Chun
 ## API-Referenz
 
 ### `GET /`
+
 Gibt die SPA (`index.html`) zurück.
 
 ---
@@ -427,10 +435,11 @@ Gibt alle Entitäten und Relationen der aktuellen Sitzung zurück.
 **Header:** `X-Session-Id: <session-id>` (Pflicht)
 
 **Antwort:**
+
 ```json
 {
-  "nodes": [{"id": "...", "label": "Entitätsname", "type": "Konzept"}],
-  "edges": [{"from": "...", "to": "...", "label": "RELATES_TO-Bezeichnung"}]
+  "nodes": [{ "id": "...", "label": "Entitätsname", "type": "Konzept" }],
+  "edges": [{ "from": "...", "to": "...", "label": "RELATES_TO-Bezeichnung" }]
 }
 ```
 
@@ -446,12 +455,11 @@ Lädt eine oder mehrere PDFs hoch und startet einen Indexierungsjob im Hintergru
 **Status:** `202 Accepted`
 
 **Antwort:**
+
 ```json
 {
   "job_id": "a1b2c3...",
-  "files": [
-    {"filename": "paper.pdf", "document_id": "abc123..."}
-  ],
+  "files": [{ "filename": "paper.pdf", "document_id": "abc123..." }],
   "status": "queued",
   "estimated_seconds": 45
 }
@@ -469,11 +477,17 @@ Gibt den aktuellen Status eines Indexierungsjobs zurück.
 **Fehler:** `404` wenn Job nicht gefunden oder zu einer anderen Sitzung gehört.
 
 **Antwort (JobState):**
+
 ```json
 {
   "job_id": "a1b2c3...",
   "files": [
-    {"filename": "paper.pdf", "document_id": "abc123...", "status": "done", "error": null}
+    {
+      "filename": "paper.pdf",
+      "document_id": "abc123...",
+      "status": "done",
+      "error": null
+    }
   ],
   "status": "running",
   "step": "extracting",
@@ -501,6 +515,7 @@ Führt eine vollständige RAG-Abfrage durch (synchron).
 
 **Header:** `X-Session-Id: <session-id>` (Pflicht)  
 **Body:**
+
 ```json
 {
   "question": "Wie funktioniert X?",
@@ -508,10 +523,12 @@ Führt eine vollständige RAG-Abfrage durch (synchron).
   "hops": 2
 }
 ```
+
 `top_k`: 1–50 (optional, Standard: `QUERY_TOP_K`)  
 `hops`: 1–3 (optional, Standard: `GRAPH_HOPS`)
 
 **Antwort:**
+
 ```json
 {
   "answer": "X funktioniert durch... [S1] [S3]",
@@ -520,7 +537,7 @@ Führt eine vollständige RAG-Abfrage durch (synchron).
   "graph_chunks": 3,
   "context": "--- [S1] paper.pdf (Chunk 4, Seite 2) ---\n...",
   "citations": [
-    {"index": 1, "chunk_id": "abc...", "title": "paper.pdf", "page_number": 2}
+    { "index": 1, "chunk_id": "abc...", "title": "paper.pdf", "page_number": 2 }
   ]
 }
 ```
@@ -536,6 +553,7 @@ Wie `/api/query`, aber die Antwort wird als **Server-Sent Events (SSE)** gestrea
 **Content-Type:** `text/event-stream`
 
 **Event-Sequenz:**
+
 ```
 event: meta
 data: {"query_entities": [...], "vector_chunks": 5, "graph_chunks": 3, "citations": [...]}
@@ -562,13 +580,17 @@ Gibt den extrahierten Text eines Dokuments seitenweise zurück (pypdf + OCR).
 
 **Header:** `X-Session-Id: <session-id>` (Pflicht)  
 **Antwort:**
+
 ```json
 {
   "document_id": "abc123...",
   "title": "paper.pdf",
   "pages": [
-    {"page_number": 1, "text": "Einleitung\n\nDiese Arbeit beschäftigt sich mit..."},
-    {"page_number": 2, "text": "..."}
+    {
+      "page_number": 1,
+      "text": "Einleitung\n\nDiese Arbeit beschäftigt sich mit..."
+    },
+    { "page_number": 2, "text": "..." }
   ]
 }
 ```
@@ -601,57 +623,57 @@ Alle Variablen können in `.env` gesetzt werden (wird beim Start geladen).
 
 ### LLM
 
-| Variable | Standard | Beschreibung |
-|---|---|---|
-| `LLM_API_KEY` | — **(Pflicht)** | DeepSeek API-Key (oder ein beliebiger OpenAI-kompatibler Key wenn `LLM_BASE_URL` gesetzt ist) |
-| `LLM_MODEL` | `deepseek-v4-pro` | Modell für Antwortgenerierung und query-seitige Entitätsextraktion |
-| `LLM_EXTRACTION_MODEL` | `deepseek-v4-flash` | Modell für die per-Chunk-Entitätsextraktion beim Indexieren. Standardmäßig ein günstigeres/schnelleres Schwestermodell |
-| `LLM_BASE_URL` | `https://api.deepseek.com` | OpenAI-kompatibler Base-URL. Überschreiben, um einen anderen Provider zu nutzen (z.B. OpenAI, Groq, lokales Ollama) |
+| Variable               | Standard                   | Beschreibung                                                                                                           |
+| ---------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `LLM_API_KEY`          | — **(Pflicht)**            | DeepSeek API-Key (oder ein beliebiger OpenAI-kompatibler Key wenn `LLM_BASE_URL` gesetzt ist)                          |
+| `LLM_MODEL`            | `deepseek-v4-pro`          | Modell für Antwortgenerierung und query-seitige Entitätsextraktion                                                     |
+| `LLM_EXTRACTION_MODEL` | `deepseek-v4-flash`        | Modell für die per-Chunk-Entitätsextraktion beim Indexieren. Standardmäßig ein günstigeres/schnelleres Schwestermodell |
+| `LLM_BASE_URL`         | `https://api.deepseek.com` | OpenAI-kompatibler Base-URL. Überschreiben, um einen anderen Provider zu nutzen (z.B. OpenAI, Groq, lokales Ollama)    |
 
 ### Neo4j
 
-| Variable | Standard | Beschreibung |
-|---|---|---|
-| `NEO4J_URI` | `bolt://localhost:7687` | Bolt-Verbindungs-URI |
-| `NEO4J_USERNAME` | `neo4j` | Datenbankbenutzername |
-| `NEO4J_PASSWORD` | `password123` | Muss mit dem beim `neo4j-admin dbms set-initial-password` gesetzten Wert übereinstimmen |
-| `NEO4J_DATABASE` | `neo4j` | Datenbankname |
+| Variable         | Standard                | Beschreibung                                                                            |
+| ---------------- | ----------------------- | --------------------------------------------------------------------------------------- |
+| `NEO4J_URI`      | `bolt://localhost:7687` | Bolt-Verbindungs-URI                                                                    |
+| `NEO4J_USERNAME` | `neo4j`                 | Datenbankbenutzername                                                                   |
+| `NEO4J_PASSWORD` | `password123`           | Muss mit dem beim `neo4j-admin dbms set-initial-password` gesetzten Wert übereinstimmen |
+| `NEO4J_DATABASE` | `neo4j`                 | Datenbankname                                                                           |
 
 ### Embeddings
 
-| Variable | Standard | Beschreibung |
-|---|---|---|
-| `EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | HuggingFace-Modell-ID. Muss 384-Dim-Vektoren erzeugen, um mit dem Vektorindex übereinzustimmen. Mehrsprachig: Deutsch + Englisch |
-| `EMBEDDING_DIMENSIONS` | `384` | Dimensionszahl des Vektorindex. Bei Wechsel des Embedding-Modells anpassen und alle Dokumente neu indexieren |
-| `EMBEDDING_BATCH_SIZE` | `64` | Anzahl Chunks pro Embedding-Batch. Erhöhen bei GPUs mit viel VRAM |
-| `EMBEDDING_DEVICE` | `cpu` | `cpu`, `mps` (Apple Silicon), `cuda`, oder `auto` (erkennt MPS automatisch) |
+| Variable               | Standard                                                      | Beschreibung                                                                                                                     |
+| ---------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `EMBEDDING_MODEL`      | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | HuggingFace-Modell-ID. Muss 384-Dim-Vektoren erzeugen, um mit dem Vektorindex übereinzustimmen. Mehrsprachig: Deutsch + Englisch |
+| `EMBEDDING_DIMENSIONS` | `384`                                                         | Dimensionszahl des Vektorindex. Bei Wechsel des Embedding-Modells anpassen und alle Dokumente neu indexieren                     |
+| `EMBEDDING_BATCH_SIZE` | `64`                                                          | Anzahl Chunks pro Embedding-Batch. Erhöhen bei GPUs mit viel VRAM                                                                |
+| `EMBEDDING_DEVICE`     | `cpu`                                                         | `cpu`, `mps` (Apple Silicon), `cuda`, oder `auto` (erkennt MPS automatisch)                                                      |
 
 ### Indexierung
 
-| Variable | Standard | Beschreibung |
-|---|---|---|
-| `CHUNK_SPLIT_LENGTH` | `10` | Sätze pro Chunk |
-| `CHUNK_SPLIT_OVERLAP` | `2` | Satz-Überschneidung zwischen Chunks |
-| `EXTRACTION_CONCURRENCY` | `30` | Parallele LLM-Aufrufe während der Entitätsextraktion. Erhöhen für schnelleres Indexieren, wenn der Provider dies verträgt |
-| `EXTRACTION_TIMEOUT_SECONDS` | `600` | Gesamtes Timeout für den Entitätsextraktionsschritt eines Indexierungsjobs |
-| `EXTRACTION_MAX_RETRIES` | `4` | Anzahl der Wiederholungsversuche bei fehlgeschlagener Entitätsextraktion pro Chunk |
-| `ENTITY_MAX_TOKENS` | `1200` | Max. LLM-Output-Tokens für die Entitätsextraktion pro Chunk |
-| `OCR_ENABLED` | `true` | OCR für bild-basierte PDF-Seiten aktivieren. Erfordert Tesseract |
-| `OCR_LANGUAGE` | `deu+eng` | Tesseract-Sprache(n). Mehrere via `+` verbinden |
+| Variable                     | Standard  | Beschreibung                                                                                                              |
+| ---------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `CHUNK_SPLIT_LENGTH`         | `10`      | Sätze pro Chunk                                                                                                           |
+| `CHUNK_SPLIT_OVERLAP`        | `2`       | Satz-Überschneidung zwischen Chunks                                                                                       |
+| `EXTRACTION_CONCURRENCY`     | `30`      | Parallele LLM-Aufrufe während der Entitätsextraktion. Erhöhen für schnelleres Indexieren, wenn der Provider dies verträgt |
+| `EXTRACTION_TIMEOUT_SECONDS` | `600`     | Gesamtes Timeout für den Entitätsextraktionsschritt eines Indexierungsjobs                                                |
+| `EXTRACTION_MAX_RETRIES`     | `4`       | Anzahl der Wiederholungsversuche bei fehlgeschlagener Entitätsextraktion pro Chunk                                        |
+| `ENTITY_MAX_TOKENS`          | `1200`    | Max. LLM-Output-Tokens für die Entitätsextraktion pro Chunk                                                               |
+| `OCR_ENABLED`                | `true`    | OCR für bild-basierte PDF-Seiten aktivieren. Erfordert Tesseract                                                          |
+| `OCR_LANGUAGE`               | `deu+eng` | Tesseract-Sprache(n). Mehrere via `+` verbinden                                                                           |
 
 ### Abfrage
 
-| Variable | Standard | Beschreibung |
-|---|---|---|
-| `QUERY_TOP_K` | `20` | Vektor-Treffer vor der Graph-Erweiterung |
-| `GRAPH_HOPS` | `2` | Graphtraversierungs-Tiefe. Wird auf 1–3 begrenzt |
-| `GRAPH_MAX_HOPS` | `3` | Absolute Obergrenze für Hops |
-| `GRAPH_LIMIT` | `8` | Max. Graph-Chunks pro Abfrage |
-| `MIN_SIMILARITY` | `0.25` | Cosine-Ähnlichkeitsschwelle. Chunks unterhalb dieser Schwelle werden verworfen |
-| `MAX_CONTEXT_CHARS` | `16000` | Zeichenbudget für den zusammengeführten Kontextblock |
-| `ANSWER_MAX_TOKENS` | `1500` | Max. LLM-Output-Tokens für die Antwortgenerierung |
-| `ANSWER_TIMEOUT_SECONDS` | `60` | Hartes Timeout (Sekunden) für den Antwort-LLM-Aufruf |
-| `ANSWER_MAX_RETRIES` | `2` | Wiederholungsversuche bei fehlgeschlagener Antwortgenerierung |
+| Variable                 | Standard | Beschreibung                                                                   |
+| ------------------------ | -------- | ------------------------------------------------------------------------------ |
+| `QUERY_TOP_K`            | `20`     | Vektor-Treffer vor der Graph-Erweiterung                                       |
+| `GRAPH_HOPS`             | `2`      | Graphtraversierungs-Tiefe. Wird auf 1–3 begrenzt                               |
+| `GRAPH_MAX_HOPS`         | `3`      | Absolute Obergrenze für Hops                                                   |
+| `GRAPH_LIMIT`            | `8`      | Max. Graph-Chunks pro Abfrage                                                  |
+| `MIN_SIMILARITY`         | `0.25`   | Cosine-Ähnlichkeitsschwelle. Chunks unterhalb dieser Schwelle werden verworfen |
+| `MAX_CONTEXT_CHARS`      | `16000`  | Zeichenbudget für den zusammengeführten Kontextblock                           |
+| `ANSWER_MAX_TOKENS`      | `1500`   | Max. LLM-Output-Tokens für die Antwortgenerierung                              |
+| `ANSWER_TIMEOUT_SECONDS` | `60`     | Hartes Timeout (Sekunden) für den Antwort-LLM-Aufruf                           |
+| `ANSWER_MAX_RETRIES`     | `2`      | Wiederholungsversuche bei fehlgeschlagener Antwortgenerierung                  |
 
 ---
 
@@ -663,14 +685,14 @@ pytest -q
 
 Alle Tests verwenden Fakes — kein Neo4j, kein Netz, kein LLM-Key nötig.
 
-| Testdatei | Abdeckung |
-|---|---|
-| `test_indexing_helpers.py` | Lokales Parsen, Chunk-Metadaten-Normalisierung, Abschnittserkennung, ToC-Erkennung |
-| `test_indexing_sections.py` | Satzbasiertes Splitting, Fallback-Splitter, Abschnittstitel-Einbettung |
-| `test_context_merger.py` | Deduplizierung von Chunks, Zeichenbudget, Citation-Index-Vergabe |
-| `test_entity_extractor.py` | JSON-Parsing der Extraktion, Drop malformed relations, Parallelverarbeitung |
-| `test_neo4j_store.py` | MERGE-Statements für Chunks, Entitäten, Relationen, NEXT_CHUNK; Hops-Begrenzung auf 1–3; section_title_search |
-| `test_web_app.py` | Graph-Payload-Form, Upload-Validierung (kein nicht-PDF, max. 50 MB), HTML-Serving, Query-Endpoint mit gemockter Pipeline |
+| Testdatei                   | Abdeckung                                                                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `test_indexing_helpers.py`  | Lokales Parsen, Chunk-Metadaten-Normalisierung, Abschnittserkennung, ToC-Erkennung                                       |
+| `test_indexing_sections.py` | Satzbasiertes Splitting, Fallback-Splitter, Abschnittstitel-Einbettung                                                   |
+| `test_context_merger.py`    | Deduplizierung von Chunks, Zeichenbudget, Citation-Index-Vergabe                                                         |
+| `test_entity_extractor.py`  | JSON-Parsing der Extraktion, Drop malformed relations, Parallelverarbeitung                                              |
+| `test_neo4j_store.py`       | MERGE-Statements für Chunks, Entitäten, Relationen, NEXT_CHUNK; Hops-Begrenzung auf 1–3; section_title_search            |
+| `test_web_app.py`           | Graph-Payload-Form, Upload-Validierung (kein nicht-PDF, max. 50 MB), HTML-Serving, Query-Endpoint mit gemockter Pipeline |
 
 ```bash
 # Mit Coverage-Bericht
@@ -696,6 +718,7 @@ Fragen nach spezifischen Abschnitten (`Fazit`, `Methodik`, `Abstract` usw.) trig
 Top-k Chunks kommen aus der Vektorsuche; weitere Chunks werden via Graphtraversierung über die Entitäten eingebracht, die diese Chunks erwähnen und die in der Frage selbst erkannt wurden. Beide Sets werden unter einem Zeichenbudget zusammengeführt.
 
 **Trade-offs:**
+
 - Indexierung ist teurer — ein LLM-Aufruf pro Chunk (abgemildert durch hohes Concurrency-Default und günstigeres Extraktionsmodell).
 - Retrieval-Qualität hängt von der Extraktionsqualität ab. Ein schwaches Modell erzeugt einen spärlichen, verrauschten Graphen, der schlechter abschneidet als reine Vektorsuche.
 - Für Korpora, bei denen die meisten Abfragen einfache Lookups sind, fügt die Graphschicht Latenz ohne Mehrwert hinzu.

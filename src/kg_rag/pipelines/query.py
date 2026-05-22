@@ -94,6 +94,7 @@ def _per_doc_limit(docs: list[Document], limit: int) -> list[Document]:
 # A query like "was ist die schlussbetrachtung" triggers a direct Neo4j lookup for
 # chunks whose section_title contains "conclusion", bypassing the similarity filter.
 _SECTION_TRIGGERS: list[tuple[str, str]] = [
+    ("schluss", "conclusion"),
     ("schlussbetrachtung", "conclusion"),
     ("schlussfolgerung", "conclusion"),
     ("fazit", "conclusion"),
@@ -121,7 +122,7 @@ def _extract_section_keywords(question: str) -> list[str]:
     lower = question.lower()
     found: set[str] = set()
     for trigger, keyword in _SECTION_TRIGGERS:
-        if trigger in lower:
+        if re.search(r"\b" + re.escape(trigger), lower):
             found.add(keyword)
     return list(found)
 
@@ -278,9 +279,20 @@ class QueryPipeline:
         if section_future is not None:
             try:
                 section_docs = section_future.result()
-                seen_ids = {str(document_meta(d).get("chunk_id")) for d in vector_documents}
+                existing = {str(document_meta(d).get("chunk_id")): d for d in vector_documents}
                 for doc in section_docs:
-                    if str(document_meta(doc).get("chunk_id")) not in seen_ids:
+                    cid = str(document_meta(doc).get("chunk_id"))
+                    if cid in existing:
+                        # Chunk already retrieved by vector/BM25 — mark it for bypass in-place
+                        # so the cross-encoder cannot demote it away from context.
+                        target = existing[cid]
+                        m = document_meta(target)
+                        m["bypass_rerank"] = True
+                        if hasattr(target, "meta"):
+                            target.meta = m
+                        vector_documents.remove(target)
+                        vector_documents.insert(0, target)
+                    else:
                         m = document_meta(doc)
                         m["bypass_rerank"] = True
                         if hasattr(doc, "meta"):
