@@ -42,10 +42,17 @@ class BM25Retriever:
         return BM25Okapi(tokenized), records
 
     def _get_index(self, session_id: str) -> tuple[Any, list[dict]]:
+        cache = self.__class__._cache
+        cached = cache.get(session_id)
+        if cached is not None:
+            return cached
+        built = self._build_index(session_id)
         with self.__class__._lock:
-            if session_id not in self.__class__._cache:
-                self.__class__._cache[session_id] = self._build_index(session_id)
-            return self.__class__._cache[session_id]
+            existing = cache.get(session_id)
+            if existing is not None:
+                return existing
+            cache[session_id] = built
+            return built
 
     def search(self, query: str, *, session_id: str, top_k: int = 60) -> list[Document]:
         try:

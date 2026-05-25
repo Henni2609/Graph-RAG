@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -104,7 +105,10 @@ class JobState:
 INDEXING_JOBS: dict[str, JobState] = {}
 JOBS_LOCK = threading.Lock()
 MANIFEST_LOCK = threading.Lock()
-JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="indexing-job")
+JOB_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("JOB_CONCURRENCY", "1")),
+    thread_name_prefix="indexing-job",
+)
 
 _PDF_PAGES_CACHE: dict[str, list[dict[str, Any]]] = {}
 _PDF_PAGES_CACHE_LOCK = threading.Lock()
@@ -423,11 +427,25 @@ def _run_indexing_job(job_id: str, pdf_paths: list[Path], config: RagConfig) -> 
 
     pipeline = IndexingPipeline(config)
     try:
+        ocr_map: dict[str, dict[int, str]] = {}
+
+        def on_pages_loaded(docs: list) -> None:
+            from kg_rag.compat import document_content, document_meta
+            for doc in docs:
+                meta = document_meta(doc)
+                if meta.get("extraction") != "ocr":
+                    continue
+                doc_id = str(meta.get("document_id", ""))
+                page = int(meta.get("page_number", 0))
+                if doc_id and page:
+                    ocr_map.setdefault(doc_id, {})[page] = document_content(doc)
+
         chunk_count = pipeline.run(
             pdf_paths,
             session_id=session_id,
             progress=progress,
             on_file=on_file,
+            on_pages_loaded=on_pages_loaded,
         )
         _purge_orphan_chunks(config, session_id)
         invalidate_embedding_meta(session_id)
@@ -440,7 +458,7 @@ def _run_indexing_job(job_id: str, pdf_paths: list[Path], config: RagConfig) -> 
         for doc_id, pdf_path in doc_id_to_path.items():
             threading.Thread(
                 target=_precache_pdf_pages,
-                args=(doc_id, pdf_path, config.ocr_language),
+                args=(doc_id, pdf_path, config.ocr_language, ocr_map.get(doc_id, {})),
                 name=f"pdf-precache-{doc_id[:8]}",
                 daemon=True,
             ).start()
@@ -561,9 +579,9 @@ def _warmup_pdf_libs() -> None:
         pass
 
 
-def _precache_pdf_pages(document_id: str, path: Path, ocr_language: str) -> None:
+def _precache_pdf_pages(document_id: str, path: Path, ocr_language: str, precomputed_ocr: dict[int, str] | None = None) -> None:
     try:
-        pages = _extract_pdf_pages(path, ocr_language=ocr_language)
+        pages = _extract_pdf_pages(path, ocr_language=ocr_language, precomputed_ocr=precomputed_ocr)
         with _PDF_PAGES_CACHE_LOCK:
             _PDF_PAGES_CACHE[document_id] = pages
         logger.info("PDF-Seiten vorgeladen für Dokument %s (%d Seiten)", document_id[:8], len(pages))
@@ -571,8 +589,12 @@ def _precache_pdf_pages(document_id: str, path: Path, ocr_language: str) -> None
         logger.exception("PDF-Vorladen fehlgeschlagen für Dokument %s", document_id[:8])
 
 
-def _extract_pdf_pages(path: Path, ocr_language: str = "deu+eng") -> list[dict[str, Any]]:
-    # --- pypdf text extraction ---
+def _extract_pdf_pages(
+    path: Path,
+    ocr_language: str = "deu+eng",
+    precomputed_ocr: dict[int, str] | None = None,
+) -> list[dict[str, Any]]:
+    # --- pypdf text extraction (always run, cheap) ---
     text_by_page: dict[int, str] = {}
     try:
         from haystack.components.converters.pypdf import PyPDFToDocument
@@ -596,32 +618,35 @@ def _extract_pdf_pages(path: Path, ocr_language: str = "deu+eng") -> list[dict[s
             if text:
                 text_by_page[idx] = text
 
-    # --- OCR extraction from embedded images ---
-    ocr_by_page: dict[int, str] = {}
-    try:
-        import pytesseract
-        from pypdf import PdfReader
+    # --- OCR: reuse results from ingestion if available, else run ---
+    if precomputed_ocr is not None:
+        ocr_by_page: dict[int, str] = precomputed_ocr
+    else:
+        ocr_by_page = {}
+        try:
+            import pytesseract
+            from pypdf import PdfReader
 
-        reader = PdfReader(str(path))
-        for page_idx, page in enumerate(reader.pages, start=1):
-            page_texts: list[str] = []
-            try:
-                images = page.images
-            except Exception:
-                continue
-            for img_file in images:
+            reader = PdfReader(str(path))
+            for page_idx, page in enumerate(reader.pages, start=1):
+                page_texts: list[str] = []
                 try:
-                    text = pytesseract.image_to_string(img_file.image, lang=ocr_language)
-                    if text.strip():
-                        page_texts.append(text.strip())
-                except pytesseract.TesseractNotFoundError:
-                    break
+                    images = page.images
                 except Exception:
                     continue
-            if page_texts:
-                ocr_by_page[page_idx] = "\n".join(page_texts)
-    except ImportError:
-        pass
+                for img_file in images:
+                    try:
+                        text = pytesseract.image_to_string(img_file.image, lang=ocr_language)
+                        if text.strip():
+                            page_texts.append(text.strip())
+                    except pytesseract.TesseractNotFoundError:
+                        break
+                    except Exception:
+                        continue
+                if page_texts:
+                    ocr_by_page[page_idx] = "\n".join(page_texts)
+        except ImportError:
+            pass
 
     # --- merge: combine pypdf text + OCR per page ---
     pages: list[dict[str, Any]] = []

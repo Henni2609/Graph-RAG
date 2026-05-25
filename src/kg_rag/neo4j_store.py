@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterator
 
 from kg_rag.compat import Document, document_content, document_embedding, document_meta, make_document
 from kg_rag.config import Neo4jConfig
@@ -475,6 +475,7 @@ class Neo4jGraphStore:
             score_expr = "1.0"
         records = self.execute_read(
             f"""
+            CALL {{
             MATCH (seed:Chunk)
             WHERE seed.id IN $chunk_ids AND seed.session_id = $session_id
             MATCH (seed)-[:MENTIONS]->(:Entity)-[:RELATES_TO*1..{hops}]-(:Entity)<-[:MENTIONS]-(chunk:Chunk)
@@ -488,6 +489,7 @@ class Neo4jGraphStore:
                    chunk.title AS title,
                    chunk.section_title AS section_title,
                    {score_expr} AS score
+            LIMIT $limit
             UNION
             MATCH (query_entity:Entity)
             WHERE query_entity.name_normalized IN $query_entities
@@ -503,6 +505,10 @@ class Neo4jGraphStore:
                    chunk.title AS title,
                    chunk.section_title AS section_title,
                    {score_expr} AS score
+            LIMIT $limit
+            }}
+            RETURN id, text, chunk_index, page_number, document_id, source, title, section_title, score
+            ORDER BY score DESC
             LIMIT $limit
             """,
             **params,
@@ -560,7 +566,7 @@ class Neo4jGraphStore:
             """
             MATCH (source:Entity)
             WHERE source.name_normalized IN $names AND source.session_id = $session_id
-            MATCH (source)-[rel:RELATES_TO]-(target:Entity)
+            MATCH (source)-[rel:RELATES_TO]->(target:Entity)
             WHERE target.session_id = $session_id
             RETURN DISTINCT source.name AS source,
                    coalesce(rel.relation, 'RELATES_TO') AS relation,
@@ -579,14 +585,22 @@ class Neo4jGraphStore:
         return "\n".join(lines)
 
     def execute_write(self, query: str, **parameters: Any) -> list[dict[str, Any]]:
-        with self.driver.session(database=self.config.database) as session:
-            result = session.run(query, **parameters)
-            return [dict(record) for record in result]
+        try:
+            with self.driver.session(database=self.config.database) as session:
+                result = session.run(query, **parameters)
+                return [dict(record) for record in result]
+        except Exception:
+            logger.error(f"Neo4j write failed: {query.splitlines()[0].strip()}")
+            raise
 
     def execute_read(self, query: str, **parameters: Any) -> list[dict[str, Any]]:
-        with self.driver.session(database=self.config.database) as session:
-            result = session.run(query, **parameters)
-            return [dict(record) for record in result]
+        try:
+            with self.driver.session(database=self.config.database) as session:
+                result = session.run(query, **parameters)
+                return [dict(record) for record in result]
+        except Exception:
+            logger.error(f"Neo4j read failed: {query.splitlines()[0].strip()}")
+            raise
 
 
 def _chunks_of(items: list[Any], size: int) -> Iterator[list[Any]]:

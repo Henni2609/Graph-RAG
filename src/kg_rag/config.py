@@ -99,6 +99,8 @@ class RagConfig:
     embedding_device: str = "auto"
     ocr_enabled: bool = True
     ocr_language: str = "deu+eng"
+    ocr_min_text_chars: int = 100
+    ocr_concurrency: int = 0
 
     @classmethod
     def from_env(cls) -> "RagConfig":
@@ -132,4 +134,6 @@ class RagConfig:
             embedding_device=os.getenv("EMBEDDING_DEVICE", "auto"),
             ocr_enabled=_get_bool("OCR_ENABLED", True),
             ocr_language=os.getenv("OCR_LANGUAGE", "deu+eng"),
+            ocr_min_text_chars=_get_int("OCR_MIN_TEXT_CHARS", 100),
+            ocr_concurrency=_get_int("OCR_CONCURRENCY", 0),
         )

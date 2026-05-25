@@ -4,7 +4,8 @@ import functools
 import os
 import re
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -32,7 +33,7 @@ _HEADING_RE = re.compile(
 from kg_rag.compat import Document, document_content, document_meta, make_document
 from kg_rag.components.entity_extractor import EntityExtractor
 from kg_rag.config import RagConfig
-from kg_rag.logging import logger
+from kg_rag.logging import log_timing, logger
 from kg_rag.neo4j_store import DEFAULT_SESSION_ID, Neo4jGraphStore, stable_id
 
 
@@ -69,6 +70,7 @@ class IndexingPipeline:
         session_id: str = DEFAULT_SESSION_ID,
         progress: ProgressCallback | None = None,
         on_file: FileCallback | None = None,
+        on_pages_loaded: Callable[[list[Document]], None] | None = None,
     ) -> int:
         def emit(step: str, current: int = 0, total: int = 0) -> None:
             if progress is not None:
@@ -91,40 +93,49 @@ class IndexingPipeline:
         for doc_id in file_doc_ids:
             emit_file(doc_id, "parsing")
         emit("parsing")
-        documents = load_documents(
-            files,
-            session_id=session_id,
-            ocr_enabled=self.config.ocr_enabled,
-            ocr_language=self.config.ocr_language,
-        )
+        with log_timing("parse"):
+            documents = load_documents(
+                files,
+                session_id=session_id,
+                ocr_enabled=self.config.ocr_enabled,
+                ocr_language=self.config.ocr_language,
+                ocr_workers=self.config.ocr_concurrency,
+                ocr_min_text_chars=self.config.ocr_min_text_chars,
+            )
+        if on_pages_loaded is not None:
+            on_pages_loaded(documents)
         for doc_id in file_doc_ids:
             emit_file(doc_id, "indexing")
 
         emit("splitting")
-        chunks = split_documents(
-            documents,
-            split_length=self.config.chunk_split_length,
-            split_overlap=self.config.chunk_split_overlap,
-        )
-        chunks = normalize_chunk_metadata(chunks, session_id=session_id)
+        with log_timing("split"):
+            chunks = split_documents(
+                documents,
+                split_length=self.config.chunk_split_length,
+                split_overlap=self.config.chunk_split_overlap,
+            )
+            chunks = normalize_chunk_metadata(chunks, session_id=session_id)
 
         emit("embedding", 0, len(chunks))
-        embedded_chunks = embed_documents(
-            chunks,
-            model=self.config.embedding_model,
-            batch_size=self.config.embedding_batch_size,
-            device=self.config.embedding_device,
-        )
+        with log_timing("embed"):
+            embedded_chunks = embed_documents(
+                chunks,
+                model=self.config.embedding_model,
+                batch_size=self.config.embedding_batch_size,
+                device=self.config.embedding_device,
+            )
 
-        enriched_chunks = self.entity_extractor.run(embedded_chunks, progress=progress)["documents"]
+        with log_timing("extract"):
+            enriched_chunks = self.entity_extractor.run(embedded_chunks, progress=progress)["documents"]
 
-        self.store.setup_schema(dimensions=self.config.embedding_dimensions)
-        self.store.persist_documents(
-            enriched_chunks,
-            overwrite=overwrite,
-            session_id=session_id,
-            progress=progress,
-        )
+        with log_timing("persist"):
+            self.store.setup_schema(dimensions=self.config.embedding_dimensions)
+            self.store.persist_documents(
+                enriched_chunks,
+                overwrite=overwrite,
+                session_id=session_id,
+                progress=progress,
+            )
 
         # Per-document chunk reconciliation: remove stale chunks left from a
         # previous index run of the same document (e.g. after content edits).
@@ -173,6 +184,8 @@ def load_documents(
     session_id: str = DEFAULT_SESSION_ID,
     ocr_enabled: bool = True,
     ocr_language: str = "deu+eng",
+    ocr_workers: int = 0,
+    ocr_min_text_chars: int = 100,
 ) -> list[Document]:
     text_files = [path for path in files if path.suffix.lower() in {".txt", ".md"}]
     pdf_files = [path for path in files if path.suffix.lower() == ".pdf"]
@@ -184,6 +197,8 @@ def load_documents(
             session_id=session_id,
             ocr_enabled=ocr_enabled,
             ocr_language=ocr_language,
+            ocr_workers=ocr_workers,
+            ocr_min_text_chars=ocr_min_text_chars,
         )
     )
     return documents
@@ -451,6 +466,7 @@ def _ocr_pages(
     session_id: str,
     covered_pages: set[int],
     ocr_language: str,
+    ocr_workers: int = 1,
 ) -> list[Document]:
     try:
         import pytesseract
@@ -465,16 +481,30 @@ def _ocr_pages(
         logger.warning(f"Cannot open {path} for OCR: {exc}")
         return []
 
-    documents: list[Document] = []
+    # Pre-collect images serially so PdfReader is only accessed from one thread.
+    page_images: list[tuple[int, list]] = []
     for page_idx, page in enumerate(reader.pages, start=1):
         if page_idx in covered_pages:
             continue
-        page_texts: list[str] = []
         try:
-            images = page.images
+            imgs = list(page.images)
         except Exception:
             continue
-        for img_file in images:
+        if imgs:
+            page_images.append((page_idx, imgs))
+
+    if not page_images:
+        return []
+
+    source_meta = _source_metadata(path, session_id=session_id)
+    results: list[Document | None] = [None] * len(page_images)
+    tess_missing = threading.Event()
+
+    def _ocr_one_page(slot: int, page_idx: int, imgs: list) -> None:
+        page_texts: list[str] = []
+        for img_file in imgs:
+            if tess_missing.is_set():
+                return
             try:
                 text = pytesseract.image_to_string(img_file.image, lang=ocr_language)
                 if text.strip():
@@ -482,26 +512,34 @@ def _ocr_pages(
             except pytesseract.TesseractNotFoundError:
                 # Tesseract binary not on PATH — disable OCR for this run.
                 # Install: brew install tesseract tesseract-lang
-                logger.warning("Tesseract binary not found; OCR disabled for this session")
-                return documents
+                tess_missing.set()
+                return
             except Exception as exc:
                 logger.debug(f"OCR failed for image on page {page_idx} of {path.name}: {exc}")
         if page_texts:
-            documents.append(
-                make_document(
-                    "\n".join(page_texts),
-                    meta={
-                        **_source_metadata(path, session_id=session_id),
-                        "page_number": page_idx,
-                        "extraction": "ocr",
-                    },
-                )
+            results[slot] = make_document(
+                "\n".join(page_texts),
+                meta={**source_meta, "page_number": page_idx, "extraction": "ocr"},
             )
-    return documents
+
+    workers = max(1, ocr_workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_ocr_one_page, i, page_idx, imgs)
+            for i, (page_idx, imgs) in enumerate(page_images)
+        ]
+        for future in as_completed(futures):
+            future.result()
+
+    if tess_missing.is_set():
+        logger.warning("Tesseract binary not found; OCR disabled for this session")
+
+    return [doc for doc in results if doc is not None]
 
 
-def _parse_single_pdf(args: tuple[Path, str, bool, str]) -> list[Document]:
-    path, session_id, ocr_enabled, ocr_language = args
+def _parse_single_pdf(args: tuple[Path, str, bool, str, int, int]) -> list[Document]:
+    path, session_id, ocr_enabled, ocr_language, ocr_workers, ocr_min_text_chars = args
+    covered_pages: set[int] = set()
     try:
         from haystack.components.converters.pypdf import PyPDFToDocument
 
@@ -512,6 +550,11 @@ def _parse_single_pdf(args: tuple[Path, str, bool, str]) -> list[Document]:
             if result["documents"]
             else []
         )
+        if result["documents"] and ocr_min_text_chars > 0:
+            full_text = document_content(result["documents"][0])
+            for page_idx, raw in enumerate(full_text.split("\x0c"), start=1):
+                if len(_clean_page_text(raw)) >= ocr_min_text_chars:
+                    covered_pages.add(page_idx)
     except Exception as exc:
         logger.warning(f"Haystack PDF converter failed for {path}, using fallback: {exc}")
         from pypdf import PdfReader
@@ -526,14 +569,16 @@ def _parse_single_pdf(args: tuple[Path, str, bool, str]) -> list[Document]:
                 text,
                 meta={**_source_metadata(path, session_id=session_id), "page_number": page_idx},
             ))
+            if ocr_min_text_chars > 0 and len(_clean_page_text(text)) >= ocr_min_text_chars:
+                covered_pages.add(page_idx)
 
     if not ocr_enabled:
         return text_docs
 
-    # Pass empty covered_pages so OCR runs on images on every page.
-    # For text-only PDFs page.images is empty → no overhead.
+    # OCR only pages not covered by pypdf text extraction.
+    # For text-only PDFs page.images is empty anyway → no overhead.
     # For slide/mixed PDFs this captures body content that pypdf misses.
-    return text_docs + _ocr_pages(path, session_id, set(), ocr_language)
+    return text_docs + _ocr_pages(path, session_id, covered_pages, ocr_language, ocr_workers)
 
 
 def _load_pdf_documents(
@@ -542,15 +587,21 @@ def _load_pdf_documents(
     session_id: str = DEFAULT_SESSION_ID,
     ocr_enabled: bool = True,
     ocr_language: str = "deu+eng",
+    ocr_workers: int = 0,
+    ocr_min_text_chars: int = 100,
 ) -> list[Document]:
     if not files:
         return []
+    cpu = os.cpu_count() or 1
+    effective_ocr_workers = ocr_workers if ocr_workers > 0 else cpu
     if len(files) == 1:
-        return _parse_single_pdf((files[0], session_id, ocr_enabled, ocr_language))
-    max_workers = min(len(files), os.cpu_count() or 1)
+        return _parse_single_pdf((files[0], session_id, ocr_enabled, ocr_language, effective_ocr_workers, ocr_min_text_chars))
+    max_workers = min(len(files), cpu)
+    # Distribute OCR threads across file processes to avoid oversubscribing cores.
+    per_file_ocr_workers = max(1, cpu // len(files))
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(_parse_single_pdf, (f, session_id, ocr_enabled, ocr_language))
+            executor.submit(_parse_single_pdf, (f, session_id, ocr_enabled, ocr_language, per_file_ocr_workers, ocr_min_text_chars))
             for f in files
         ]
     documents = []

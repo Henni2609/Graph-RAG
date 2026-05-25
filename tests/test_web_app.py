@@ -397,7 +397,7 @@ def test_run_indexing_job_marks_done_on_success(monkeypatch, tmp_path) -> None:
         def __init__(self, config) -> None:
             self.store = FakeStore()
 
-        def run(self, paths, *, session_id, progress, on_file=None):
+        def run(self, paths, *, session_id, progress, on_file=None, on_pages_loaded=None):
             progress("parsing", 0, 0)
             progress("extracting", 0, 2)
             progress("extracting", 2, 2)
@@ -438,7 +438,7 @@ def test_run_indexing_job_marks_error_on_failure(monkeypatch, tmp_path) -> None:
         def __init__(self, config) -> None:
             self.store = type("S", (), {"close": lambda self: None})()
 
-        def run(self, paths, *, session_id, progress, on_file=None):
+        def run(self, paths, *, session_id, progress, on_file=None, on_pages_loaded=None):
             raise RuntimeError("boom")
 
     monkeypatch.setattr(web_app, "IndexingPipeline", BrokenPipeline)

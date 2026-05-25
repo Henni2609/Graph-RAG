@@ -120,3 +120,30 @@ def test_graph_search_clamps_hops_to_three() -> None:
 
     graph_query = next(query for query, params in driver.calls if "RELATES_TO*1..3" in query)
     assert "RELATES_TO*0..3" in graph_query
+
+
+def test_graph_search_limits_both_union_branches() -> None:
+    driver = FakeDriver()
+    store = Neo4jGraphStore(Neo4jConfig(), driver=driver)
+
+    store.graph_search(chunk_ids=["chunk-1"], query_entities=["Neo4j"], limit=5)
+
+    graph_query, params = next(
+        (query, p) for query, p in driver.calls if isinstance(query, str) and "RELATES_TO" in query
+    )
+    assert graph_query.count("LIMIT $limit") == 3
+    assert params["limit"] == 5
+    assert "ORDER BY score DESC" in graph_query
+
+
+def test_entity_context_uses_directed_relationship() -> None:
+    driver = FakeDriver()
+    store = Neo4jGraphStore(Neo4jConfig(), driver=driver)
+
+    store.entity_context(["Neo4j"])
+
+    ctx_query = next(
+        query for query, _params in driver.calls if isinstance(query, str) and "RELATES_TO" in query
+    )
+    assert "(source)-[rel:RELATES_TO]->(target:Entity)" in ctx_query
+    assert "(source)-[rel:RELATES_TO]-(target:Entity)" not in ctx_query

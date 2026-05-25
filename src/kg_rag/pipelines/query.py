@@ -453,16 +453,15 @@ class QueryPipeline:
     def _check_embedding_compatibility(self, session_id: str) -> None:
         with _embedding_meta_lock:
             cached = _embedding_meta_cache.get(session_id)
-        if cached is None:
-            try:
-                stored = self.store.get_indexing_meta(session_id)
-            except Exception:
-                return
-            if not stored:
-                return
-            with _embedding_meta_lock:
+            if cached is None:
+                try:
+                    stored = self.store.get_indexing_meta(session_id)
+                except Exception:
+                    return
+                if not stored:
+                    return
                 _embedding_meta_cache[session_id] = stored
-            cached = stored
+                cached = stored
         stored_model = cached.get("model", "")
         stored_dim = cached.get("dimensions")
         if stored_model and stored_model != self.config.embedding_model:
