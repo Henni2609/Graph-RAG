@@ -286,62 +286,60 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             t0 = time.perf_counter()
             pipeline = QueryPipeline(app_config)
             try:
-                retrieval: RetrievalResult = await asyncio.to_thread(
-                    pipeline.retrieve,
-                    question,
-                    top_k=request.top_k,
-                    hops=request.hops,
-                    session_id=session_id,
-                )
-            except Exception as exc:
-                logger.exception("Stream query retrieval failed")
-                yield f"event: error\ndata: {json.dumps({'detail': f'Anfrage fehlgeschlagen: {exc}'})}\n\n"
-                return
-            finally:
                 try:
-                    pipeline.store.close()
-                except Exception:
-                    pass
+                    retrieval: RetrievalResult = await asyncio.to_thread(
+                        pipeline.retrieve,
+                        question,
+                        top_k=request.top_k,
+                        hops=request.hops,
+                        session_id=session_id,
+                    )
+                except Exception as exc:
+                    logger.exception("Stream query retrieval failed")
+                    yield f"event: error\ndata: {json.dumps({'detail': f'Anfrage fehlgeschlagen: {exc}'})}\n\n"
+                    return
 
-            logger.info(f"TIMING stream_retrieval: {time.perf_counter() - t0:.3f}s")
-            meta_data = {
-                "query_entities": retrieval.query_entities,
-                "vector_chunks": len(retrieval.vector_documents),
-                "graph_chunks": len(retrieval.graph_documents),
-                "citations": retrieval.citations,
-            }
-            yield f"event: meta\ndata: {json.dumps(meta_data)}\n\n"
+                logger.info(f"TIMING stream_retrieval: {time.perf_counter() - t0:.3f}s")
+                meta_data = {
+                    "query_entities": retrieval.query_entities,
+                    "vector_chunks": len(retrieval.vector_documents),
+                    "graph_chunks": len(retrieval.graph_documents),
+                    "citations": retrieval.citations,
+                }
+                yield f"event: meta\ndata: {json.dumps(meta_data)}\n\n"
 
-            if retrieval.early_answer is not None:
-                yield f"event: final\ndata: {json.dumps({'answer': retrieval.early_answer})}\n\n"
-                logger.info(f"TIMING stream_total: {time.perf_counter() - t0:.3f}s (early exit)")
-                return
+                if retrieval.early_answer is not None:
+                    yield f"event: final\ndata: {json.dumps({'answer': retrieval.early_answer})}\n\n"
+                    logger.info(f"TIMING stream_total: {time.perf_counter() - t0:.3f}s (early exit)")
+                    return
 
-            gk: dict[str, Any] = {
-                "temperature": 0.2,
-                "max_tokens": app_config.answer_max_tokens,
-                "timeout": app_config.answer_timeout_seconds,
-                "extra_body": {"thinking": {"type": "disabled"}},
-            }
-            prompt = f"Kontext:\n{retrieval.context}\n\nFrage:\n{question}"
-            tokens: list[str] = []
-            first_token = True
-            try:
-                async for delta in stream_chat_tokens(app_config.llm, ANSWER_SYSTEM_PROMPT, prompt, generation_kwargs=gk):
-                    if first_token:
-                        logger.info(f"TIMING stream_ttft: {time.perf_counter() - t0:.3f}s")
-                        first_token = False
-                    tokens.append(delta)
-                    yield f"event: token\ndata: {json.dumps({'delta': delta})}\n\n"
-            except Exception as exc:
-                logger.warning(f"Stream answer generation failed: {exc}", exc_info=True)
-                yield f"event: final\ndata: {json.dumps({'answer': _GENERATION_ERROR})}\n\n"
-                return
+                gk: dict[str, Any] = {
+                    "temperature": 0.2,
+                    "max_tokens": app_config.answer_max_tokens,
+                    "timeout": app_config.answer_timeout_seconds,
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                }
+                prompt = f"Kontext:\n{retrieval.context}\n\nFrage:\n{question}"
+                tokens: list[str] = []
+                first_token = True
+                try:
+                    async for delta in stream_chat_tokens(app_config.llm, ANSWER_SYSTEM_PROMPT, prompt, generation_kwargs=gk):
+                        if first_token:
+                            logger.info(f"TIMING stream_ttft: {time.perf_counter() - t0:.3f}s")
+                            first_token = False
+                        tokens.append(delta)
+                        yield f"event: token\ndata: {json.dumps({'delta': delta})}\n\n"
+                except Exception as exc:
+                    logger.warning(f"Stream answer generation failed: {exc}", exc_info=True)
+                    yield f"event: final\ndata: {json.dumps({'answer': _GENERATION_ERROR})}\n\n"
+                    return
 
-            valid_indexes = {c["index"] for c in retrieval.citations}
-            full_answer = sanitize_citations("".join(tokens), valid_indexes)
-            yield f"event: final\ndata: {json.dumps({'answer': full_answer})}\n\n"
-            logger.info(f"TIMING stream_total: {time.perf_counter() - t0:.3f}s")
+                valid_indexes = {c["index"] for c in retrieval.citations}
+                full_answer = sanitize_citations("".join(tokens), valid_indexes)
+                yield f"event: final\ndata: {json.dumps({'answer': full_answer})}\n\n"
+                logger.info(f"TIMING stream_total: {time.perf_counter() - t0:.3f}s")
+            finally:
+                pipeline.store.close()
 
         return StreamingResponse(
             generate(),
@@ -537,7 +535,9 @@ def _record_pdf_manifest(session_id: str, entries: list[tuple[str, str]]) -> Non
         for document_id, filename in entries:
             manifest[document_id] = filename
         try:
-            path.write_text(json.dumps(manifest), encoding="utf-8")
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(manifest), encoding="utf-8")
+            os.replace(tmp, path)
         except Exception:
             logger.exception("Failed to write PDF manifest for session %s", session_id)
 
@@ -575,7 +575,9 @@ def _remove_pdf_manifest(session_id: str, document_id: str) -> None:
             manifest = {}
         pdf_filename = manifest.pop(document_id, None)
         try:
-            path.write_text(json.dumps(manifest), encoding="utf-8")
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(manifest), encoding="utf-8")
+            os.replace(tmp, path)
         except Exception:
             logger.exception("Failed to update PDF manifest for session %s", session_id)
     # Delete the file outside the lock to avoid holding it during I/O.
@@ -692,6 +694,15 @@ def _cleanup_session_uploads(session_id: str) -> None:
     session_dir = UPLOADS_DIR / session_id
     if not session_dir.exists():
         return
+    manifest_path = _manifest_path(session_id)
+    try:
+        manifest: dict[str, str] = json.loads(manifest_path.read_text("utf-8")) if manifest_path.exists() else {}
+    except Exception:
+        manifest = {}
+    if manifest:
+        with _PDF_PAGES_CACHE_LOCK:
+            for doc_id in manifest:
+                _PDF_PAGES_CACHE.pop(doc_id, None)
     try:
         shutil.rmtree(session_dir)
     except Exception:

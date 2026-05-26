@@ -971,6 +971,14 @@
     const pendingFileEntries = new Map(); // documentId → <li> element
 
     function addFilePendingEntry(filename, documentId) {
+      const existing = pendingFileEntries.get(documentId);
+      if (existing) {
+        const metaEl = existing.querySelector('.meta');
+        if (metaEl) metaEl.textContent = 'eingereiht';
+        const badge = existing.querySelector('span:first-child');
+        if (badge) { badge.className = 'pending'; badge.textContent = '·'; }
+        return existing;
+      }
       const li = document.createElement('li');
       li.dataset.documentId = documentId;
       const badge = document.createElement('span');
@@ -1052,7 +1060,7 @@
         return;
       }
       if (activePoll) {
-        clearInterval(activePoll);
+        activePoll();
         activePoll = null;
       }
       const fd = new FormData();
@@ -1093,14 +1101,20 @@
 
     function pollJob(jobId, etaSec) {
       const intervalMs = 700;
-      const hardCapMs = Math.max(etaSec * 1500, 15 * 60 * 1000); // mind. 15 Min Puffer
+      const hardCapMs = Math.max(etaSec * 1500, 15 * 60 * 1000);
       const startedAt = Date.now();
+      let stopped = false;
+      let errorCount = 0;
       setStatus('Indexierung läuft …', 'busy');
 
+      // Returns a stop-function so callers can abort the poll.
+      function stop() { stopped = true; activePoll = null; }
+      activePoll = stop;
+
       const tick = async () => {
+        if (stopped) return;
         if (Date.now() - startedAt > hardCapMs) {
-          clearInterval(activePoll);
-          activePoll = null;
+          stop();
           hideProgress();
           dropArea.classList.remove('busy');
           pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'error', 'Zeitlimit überschritten'));
@@ -1111,42 +1125,46 @@
           const res = await fetch(`/api/jobs/${jobId}`, { headers: sessionHeaders() });
           const data = await res.json();
           if (!res.ok) {
-            clearInterval(activePoll);
-            activePoll = null;
+            stop();
             hideProgress();
             dropArea.classList.remove('busy');
             pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'error', data.detail || res.statusText));
             setStatus(`Fehler: ${data.detail || res.statusText}`, 'error');
             return;
           }
+          errorCount = 0;
           showProgress(data.step, data.current || 0, data.total || 0);
           if (Array.isArray(data.files)) {
             for (const f of data.files) updateFilePendingEntry(f.document_id, f.status, f.error);
           }
           if (data.status === 'done') {
-            clearInterval(activePoll);
-            activePoll = null;
+            stop();
             hideProgress();
             dropArea.classList.remove('busy');
-            // Finalize any entries not yet marked done by on_file callbacks
             pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'done'));
             if (data.graph) renderGraph(data.graph);
             setStatus(data.graph ? graphSummary(data.graph) : 'Fertig');
           } else if (data.status === 'error') {
-            clearInterval(activePoll);
-            activePoll = null;
+            stop();
             hideProgress();
             dropArea.classList.remove('busy');
             pendingFileEntries.forEach((_, docId) => updateFilePendingEntry(docId, 'error', data.error || 'Indexierung fehlgeschlagen'));
             setStatus(`Fehler: ${data.error || 'Indexierung fehlgeschlagen'}`, 'error');
           }
         } catch (err) {
-          // transienter Netzwerkfehler: Polling fortsetzen
+          errorCount++;
+          if (errorCount >= 5) {
+            stop();
+            hideProgress();
+            dropArea.classList.remove('busy');
+            setStatus('Verbindungsfehler beim Polling, bitte Seite neu laden', 'error');
+            return;
+          }
           console.warn('Job polling failed, retry:', err.message);
         }
+        if (!stopped) setTimeout(tick, intervalMs);
       };
       tick();
-      activePoll = setInterval(tick, intervalMs);
     }
 
     function appendMessage(role, text, options = {}) {
@@ -1312,7 +1330,7 @@
           const { done: streamDone, value } = await reader.read();
           if (streamDone) break;
           sseBuffer += decoder.decode(value, { stream: true });
-          const lines = sseBuffer.split('\n');
+          const lines = sseBuffer.split(/\r?\n/);
           sseBuffer = lines.pop();
           for (const line of lines) {
             if (line.startsWith('event: ')) {
@@ -1326,7 +1344,8 @@
                 tokens += data.delta || '';
                 const shown = renderStreamingCitations(tokens, streamMeta?.citations || []);
                 pending.textContent = shown + '▌';
-                chatMessages.scrollTop = chatMessages.scrollHeight;
+                const atBottom = chatMessages.scrollTop + chatMessages.clientHeight >= chatMessages.scrollHeight - 50;
+                if (atBottom) chatMessages.scrollTop = chatMessages.scrollHeight;
               } else if (eventType === 'final') {
                 pending.remove();
                 appendMessage('assistant', data.answer || '(leere Antwort)', {
@@ -1334,16 +1353,19 @@
                 });
                 setStatus('Antwort geliefert');
                 done = true;
+                break;
               } else if (eventType === 'error') {
                 pending.remove();
                 appendMessage('assistant', data.detail || 'Fehler', { error: true });
                 setStatus(`Fehler: ${data.detail || 'Fehler'}`, 'error');
                 done = true;
+                break;
               }
               eventType = null;
             }
           }
         }
+        if (done) reader.cancel().catch(() => {});
       } catch (err) {
         pending.remove();
         appendMessage('assistant', err.message, { error: true });

@@ -47,6 +47,8 @@ class BM25Retriever:
         if cached is not None:
             return cached
         built = self._build_index(session_id)
+        if built[0] is None:
+            return built
         with self.__class__._lock:
             existing = cache.get(session_id)
             if existing is not None:

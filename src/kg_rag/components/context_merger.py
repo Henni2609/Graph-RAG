@@ -61,7 +61,10 @@ class ContextMerger:
                 seen.add(key)
                 meta = document_meta(document)
                 meta.setdefault("retrieval_source", source)
-                meta["relevance"] = getattr(document, "score", None)
+                if meta.get("bypass_rerank"):
+                    meta["relevance"] = float("inf")
+                else:
+                    meta["relevance"] = getattr(document, "score", None)
                 if getattr(document, "meta", None) is not None:
                     document.meta = meta
                 merged.append(document)
