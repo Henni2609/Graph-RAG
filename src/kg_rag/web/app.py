@@ -160,11 +160,31 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         threading.Thread(target=_warmup_pdf_libs, name="pdf-libs-warmup", daemon=True).start()
         if app_config.reranker_enabled:
             threading.Thread(
-                target=_get_cross_encoder,
+                target=_warmup_reranker,
                 args=(app_config.reranker_model, _resolve_device(app_config.embedding_device)),
                 name="reranker-warmup",
                 daemon=True,
             ).start()
+        threading.Thread(
+            target=_warmup_llm_extraction,
+            args=(app_config,),
+            name="llm-extraction-warmup",
+            daemon=True,
+        ).start()
+
+    @app.on_event("startup")
+    async def _warm_llm_stream() -> None:
+        try:
+            gk: dict[str, Any] = {
+                "max_tokens": 1,
+                "temperature": 0,
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+            async for _ in stream_chat_tokens(app_config.llm, "ping", "1", generation_kwargs=gk):
+                break
+            logger.info("LLM stream connection warmup complete")
+        except Exception:
+            logger.exception("LLM stream connection warmup failed")
 
     @app.on_event("shutdown")
     def _shutdown_jobs() -> None:
@@ -263,6 +283,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Frage darf nicht leer sein")
 
         async def generate() -> Any:
+            t0 = time.perf_counter()
             pipeline = QueryPipeline(app_config)
             try:
                 retrieval: RetrievalResult = await asyncio.to_thread(
@@ -282,6 +303,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
                 except Exception:
                     pass
 
+            logger.info(f"TIMING stream_retrieval: {time.perf_counter() - t0:.3f}s")
             meta_data = {
                 "query_entities": retrieval.query_entities,
                 "vector_chunks": len(retrieval.vector_documents),
@@ -292,6 +314,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
 
             if retrieval.early_answer is not None:
                 yield f"event: final\ndata: {json.dumps({'answer': retrieval.early_answer})}\n\n"
+                logger.info(f"TIMING stream_total: {time.perf_counter() - t0:.3f}s (early exit)")
                 return
 
             gk: dict[str, Any] = {
@@ -302,8 +325,12 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             }
             prompt = f"Kontext:\n{retrieval.context}\n\nFrage:\n{question}"
             tokens: list[str] = []
+            first_token = True
             try:
                 async for delta in stream_chat_tokens(app_config.llm, ANSWER_SYSTEM_PROMPT, prompt, generation_kwargs=gk):
+                    if first_token:
+                        logger.info(f"TIMING stream_ttft: {time.perf_counter() - t0:.3f}s")
+                        first_token = False
                     tokens.append(delta)
                     yield f"event: token\ndata: {json.dumps({'delta': delta})}\n\n"
             except Exception as exc:
@@ -314,6 +341,7 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             valid_indexes = {c["index"] for c in retrieval.citations}
             full_answer = sanitize_citations("".join(tokens), valid_indexes)
             yield f"event: final\ndata: {json.dumps({'answer': full_answer})}\n\n"
+            logger.info(f"TIMING stream_total: {time.perf_counter() - t0:.3f}s")
 
         return StreamingResponse(
             generate(),
@@ -757,6 +785,35 @@ def _warmup_embedder(model: str, batch_size: int, device: str) -> None:
         logger.info(f"Embedder warmup complete for {model} on {_resolve_device(device)}")
     except Exception:
         logger.exception("Embedder warmup failed")
+
+
+def _warmup_reranker(model: str, device: str) -> None:
+    try:
+        encoder = _get_cross_encoder(model, device)
+        encoder.predict([("warm", "up")], show_progress_bar=False)
+        logger.info(f"Reranker warmup complete for {model} on {device}")
+    except Exception:
+        logger.exception("Reranker warmup failed")
+
+
+def _warmup_llm_extraction(config: RagConfig) -> None:
+    try:
+        from kg_rag.llm import create_chat_generator, run_chat
+        gen = create_chat_generator(
+            config.llm,
+            model=config.llm.extraction_model,
+            timeout=15,
+            max_retries=1,
+        )
+        run_chat(
+            gen,
+            "ping",
+            "1",
+            generation_kwargs={"max_tokens": 1, "temperature": 0, "extra_body": {"thinking": {"type": "disabled"}}},
+        )
+        logger.info("LLM extraction connection warmup complete")
+    except Exception:
+        logger.exception("LLM extraction connection warmup failed")
 
 
 def _reset_graph(config: RagConfig) -> None:

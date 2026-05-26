@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from kg_rag.compat import Document, component
@@ -35,15 +36,24 @@ class GraphRetriever:
         active_hops = hops if hops is not None else self.hops
         active_limit = limit if limit is not None else self.limit
 
-        documents = store.graph_search(
-            chunk_ids=chunk_ids,
-            query_embedding=query_embedding,
-            query_entities=query_entities or [],
-            hops=active_hops,
-            limit=active_limit,
-            session_id=session_id,
-        )
-        entity_context = store.entity_context(query_entities or [], limit=30, session_id=session_id)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            doc_future = pool.submit(
+                store.graph_search,
+                chunk_ids=chunk_ids,
+                query_embedding=query_embedding,
+                query_entities=query_entities or [],
+                hops=active_hops,
+                limit=active_limit,
+                session_id=session_id,
+            )
+            ctx_future = pool.submit(
+                store.entity_context,
+                query_entities or [],
+                limit=30,
+                session_id=session_id,
+            )
+            documents = doc_future.result()
+            entity_context = ctx_future.result()
         return {"documents": documents, "entity_context": entity_context}
 
     def _store(self) -> Neo4jGraphStore:

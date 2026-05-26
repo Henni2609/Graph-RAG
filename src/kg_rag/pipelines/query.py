@@ -210,19 +210,22 @@ class QueryPipeline:
         """Run all retrieval steps and return the data needed for answer generation."""
         self._check_embedding_compatibility(session_id)
         extraction_gen = self._extraction_generator()
-
-        with log_timing("embedding"):
-            query_embedding = embed_query(
-                question, model=self.config.embedding_model, device=self.config.embedding_device
-            )
-
         section_keywords = _extract_section_keywords(question)
-
         _top_k = top_k if top_k is not None else self.config.query_top_k
-        with ThreadPoolExecutor(max_workers=3) as pool:
+
+        def _embed_and_search() -> tuple[list[float], list[Document]]:
+            with log_timing("embedding"):
+                emb = embed_query(
+                    question, model=self.config.embedding_model, device=self.config.embedding_device
+                )
+            with log_timing("vector_search"):
+                return emb, self.store.vector_search(emb, top_k=_top_k, session_id=session_id)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
             entity_future = pool.submit(
                 self.extract_query_entities, question, generator=extraction_gen
             )
+            vec_future = pool.submit(_embed_and_search)
             if section_keywords:
                 section_future = pool.submit(
                     self.store.section_title_search,
@@ -239,27 +242,23 @@ class QueryPipeline:
             else:
                 bm25_future = None
 
-            with log_timing("vector_search"):
-                try:
-                    vector_documents = self.store.vector_search(
-                        query_embedding,
-                        top_k=_top_k,
-                        session_id=session_id,
-                    )
-                except Exception as exc:
-                    logger.error(f"Vector search failed: {exc}", exc_info=True)
-                    return RetrievalResult(
-                        context="",
-                        vector_documents=[],
-                        graph_documents=[],
-                        entity_context="",
-                        query_entities=[],
-                        citations=[],
-                        query_embedding=query_embedding,
-                        early_answer="Ein Datenbankfehler ist aufgetreten. Bitte versuche es erneut.",
-                    )
             with log_timing("entity_extraction_wait"):
                 query_entities = entity_future.result()
+
+            try:
+                query_embedding, vector_documents = vec_future.result()
+            except Exception as exc:
+                logger.error(f"Vector search failed: {exc}", exc_info=True)
+                return RetrievalResult(
+                    context="",
+                    vector_documents=[],
+                    graph_documents=[],
+                    entity_context="",
+                    query_entities=[],
+                    citations=[],
+                    query_embedding=[],
+                    early_answer="Ein Datenbankfehler ist aufgetreten. Bitte versuche es erneut.",
+                )
 
         vector_documents = _filter_by_similarity(vector_documents, self.config.min_similarity)
 
