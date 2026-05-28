@@ -109,6 +109,12 @@ JOB_EXECUTOR = ThreadPoolExecutor(
     max_workers=int(os.getenv("JOB_CONCURRENCY", "1")),
     thread_name_prefix="indexing-job",
 )
+# Bounded pool for best-effort PDF page pre-caching after indexing. A daemon
+# thread per document oversubscribed CPU/Tesseract on batch uploads.
+_PRECACHE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, (os.cpu_count() or 2) // 2),
+    thread_name_prefix="pdf-precache",
+)
 
 _PDF_PAGES_CACHE: dict[str, list[dict[str, Any]]] = {}
 _PDF_PAGES_CACHE_LOCK = threading.Lock()
@@ -192,6 +198,8 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         # apart mid-persist, which would leave inconsistent chunk/entity graphs.
         logger.info("Warte auf laufende Indexing-Jobs …")
         JOB_EXECUTOR.shutdown(wait=True, cancel_futures=False)
+        # Best-effort precache: drop queued tasks, don't block shutdown on them.
+        _PRECACHE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
     @app.get("/")
     def index() -> FileResponse:
@@ -485,12 +493,13 @@ def _run_indexing_job(job_id: str, pdf_paths: list[Path], config: RagConfig) -> 
                 for e, p in zip(INDEXING_JOBS[job_id].files, pdf_paths)
             } if job_id in INDEXING_JOBS else {}
         for doc_id, pdf_path in doc_id_to_path.items():
-            threading.Thread(
-                target=_precache_pdf_pages,
-                args=(doc_id, pdf_path, config.ocr_language, ocr_map.get(doc_id, {})),
-                name=f"pdf-precache-{doc_id[:8]}",
-                daemon=True,
-            ).start()
+            _PRECACHE_EXECUTOR.submit(
+                _precache_pdf_pages,
+                doc_id,
+                pdf_path,
+                config.ocr_language,
+                ocr_map.get(doc_id, {}),
+            )
         _update_job(
             job_id,
             status="done",
