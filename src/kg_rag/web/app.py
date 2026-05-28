@@ -188,7 +188,10 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     def _shutdown_jobs() -> None:
-        JOB_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        # Wait for running indexing jobs so Neo4j write sequences are not torn
+        # apart mid-persist, which would leave inconsistent chunk/entity graphs.
+        logger.info("Warte auf laufende Indexing-Jobs …")
+        JOB_EXECUTOR.shutdown(wait=True, cancel_futures=False)
 
     @app.get("/")
     def index() -> FileResponse:
