@@ -69,10 +69,10 @@ def _reciprocal_rank_fusion(ranked_lists: list[list[Document]], *, k: int = 60) 
     result = []
     for key in sorted(all_docs, key=lambda k_: -scores[k_]):
         doc = all_docs[key]
-        try:
-            doc.score = scores[key]
-        except AttributeError:
-            pass
+        meta = document_meta(doc)
+        meta["fusion_score"] = scores[key]
+        if hasattr(doc, "meta"):
+            doc.meta = meta
         result.append(doc)
     return result
 
@@ -452,15 +452,15 @@ class QueryPipeline:
     def _check_embedding_compatibility(self, session_id: str) -> None:
         with _embedding_meta_lock:
             cached = _embedding_meta_cache.get(session_id)
-            if cached is None:
-                try:
-                    stored = self.store.get_indexing_meta(session_id)
-                except Exception:
-                    return
-                if not stored:
-                    return
-                _embedding_meta_cache[session_id] = stored
-                cached = stored
+        if cached is None:
+            try:
+                stored = self.store.get_indexing_meta(session_id)
+            except Exception:
+                return
+            if not stored:
+                return
+            with _embedding_meta_lock:
+                cached = _embedding_meta_cache.setdefault(session_id, stored)
         stored_model = cached.get("model", "")
         stored_dim = cached.get("dimensions")
         if stored_model and stored_model != self.config.embedding_model:
@@ -509,10 +509,10 @@ class QueryPipeline:
 
 def sanitize_citations(answer: str, valid_indexes: set[int]) -> str:
     def _replace(m: re.Match) -> str:
-        idx = int(m.group(1))
-        return "" if idx not in valid_indexes else m.group(0)
-    result = re.sub(r"\[S(\d+)\]", _replace, answer)
-    return re.sub(r"  +", " ", result)
+        idx = int(m.group(2))
+        return m.group(1) if idx not in valid_indexes else m.group(0)
+    result = re.sub(r"(\s*)\[S(\d+)\]", _replace, answer)
+    return re.sub(r"[ \t]{2,}", " ", result)
 
 
 @functools.lru_cache(maxsize=None)

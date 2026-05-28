@@ -174,6 +174,8 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def _warm_llm_stream() -> None:
+        if os.getenv("LLM_STREAM_WARMUP", "0") not in ("1", "true", "yes"):
+            return
         try:
             gk: dict[str, Any] = {
                 "max_tokens": 1,
@@ -658,7 +660,10 @@ def _extract_pdf_pages(
             from pypdf import PdfReader
 
             reader = PdfReader(str(path))
+            tess_missing = False
             for page_idx, page in enumerate(reader.pages, start=1):
+                if tess_missing:
+                    break
                 page_texts: list[str] = []
                 try:
                     images = page.images
@@ -670,6 +675,8 @@ def _extract_pdf_pages(
                         if text.strip():
                             page_texts.append(text.strip())
                     except pytesseract.TesseractNotFoundError:
+                        logger.warning("Tesseract binary not found; OCR disabled for preview")
+                        tess_missing = True
                         break
                     except Exception:
                         continue
@@ -780,15 +787,6 @@ def run(host: str = "127.0.0.1", port: int = 8000) -> None:
     uvicorn.run(create_app(config), host=host, port=port)
 
 
-def _reset_uploads() -> None:
-    if not UPLOADS_DIR.exists():
-        return
-    try:
-        shutil.rmtree(UPLOADS_DIR)
-    except Exception:
-        logger.exception("Failed to clean uploads dir on startup")
-
-
 def _warmup_embedder(model: str, batch_size: int, device: str) -> None:
     try:
         embed_query("warmup", model=model, device=device)
@@ -827,12 +825,3 @@ def _warmup_llm_extraction(config: RagConfig) -> None:
         logger.exception("LLM extraction connection warmup failed")
 
 
-def _reset_graph(config: RagConfig) -> None:
-    store = Neo4jGraphStore(config.neo4j)
-    try:
-        store.clear()
-        logger.info("Graph database cleared for new server run")
-    except Exception:
-        logger.exception("Failed to clear graph database on startup")
-    finally:
-        store.close()

@@ -64,7 +64,7 @@ class ContextMerger:
                 if meta.get("bypass_rerank"):
                     meta["relevance"] = float("inf")
                 else:
-                    meta["relevance"] = getattr(document, "score", None)
+                    meta["relevance"] = meta.get("fusion_score") or getattr(document, "score", None)
                 if getattr(document, "meta", None) is not None:
                     document.meta = meta
                 merged.append(document)

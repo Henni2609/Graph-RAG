@@ -399,7 +399,7 @@ class Neo4jGraphStore:
               AND ANY(kw IN $keywords WHERE toLower(c.section_title) CONTAINS kw)
             WITH c
             ORDER BY c.chunk_index ASC
-            WITH c.section_title AS section_title, collect(c)[0] AS fc
+            WITH c.document_id AS document_id, c.section_title AS section_title, collect(c)[0] AS fc
             RETURN fc.id AS id,
                    fc.text AS text,
                    fc.chunk_index AS chunk_index,

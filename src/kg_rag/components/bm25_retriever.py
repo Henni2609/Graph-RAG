@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from kg_rag.compat import Document, make_document
@@ -11,7 +12,9 @@ if TYPE_CHECKING:
 
 class BM25Retriever:
     # Class-level cache so all instances share the same index and invalidation works globally.
-    _cache: dict[str, tuple[Any, list[dict]]] = {}
+    _MAX_CACHED_SESSIONS = 32
+    _cache: OrderedDict[str, tuple[Any, list[dict]]] = OrderedDict()
+    _versions: dict[str, int] = {}
     _lock = threading.Lock()
 
     def __init__(self, store: "Neo4jGraphStore") -> None:
@@ -21,6 +24,7 @@ class BM25Retriever:
     def invalidate(cls, session_id: str) -> None:
         with cls._lock:
             cls._cache.pop(session_id, None)
+            cls._versions[session_id] = cls._versions.get(session_id, 0) + 1
 
     def _build_index(self, session_id: str) -> tuple[Any, list[dict]]:
         from rank_bm25 import BM25Okapi
@@ -42,19 +46,25 @@ class BM25Retriever:
         return BM25Okapi(tokenized), records
 
     def _get_index(self, session_id: str) -> tuple[Any, list[dict]]:
-        cache = self.__class__._cache
-        cached = cache.get(session_id)
-        if cached is not None:
-            return cached
+        cls = self.__class__
+        with cls._lock:
+            v_before = cls._versions.get(session_id, 0)
+            cached = cls._cache.get(session_id)
+            if cached is not None:
+                cls._cache.move_to_end(session_id)
+                return cached
         built = self._build_index(session_id)
         if built[0] is None:
             return built
-        with self.__class__._lock:
-            existing = cache.get(session_id)
-            if existing is not None:
-                return existing
-            cache[session_id] = built
-            return built
+        with cls._lock:
+            if cls._versions.get(session_id, 0) != v_before:
+                # Invalidation happened during build — don't cache a stale index.
+                return built
+            cls._cache[session_id] = built
+            cls._cache.move_to_end(session_id)
+            while len(cls._cache) > cls._MAX_CACHED_SESSIONS:
+                cls._cache.popitem(last=False)
+        return built
 
     def search(self, query: str, *, session_id: str, top_k: int = 60) -> list[Document]:
         try:

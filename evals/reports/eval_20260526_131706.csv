@@ -1,0 +1,11 @@
+question,difficulty,source_doc,faithfulness,answer_relevancy,context_precision,context_recall,answer
+Which agent-builder tools are covered in the Agent-Builders module?,easy,12_Agent_Builders.pdf,1.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+What are the two ways to build agents mentioned in the Agent-Builders slide deck?,hard,12_Agent_Builders.pdf,0.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+Which two agent frameworks are covered in the '14_Agent_Frameworks' module?,easy,14_Agent_Frameworks.pdf,0.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+What configuration files make up a CrewAI project structure according to the Agent Frameworks slides?,easy,14_Agent_Frameworks.pdf,1.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+What execution environment does the Code Execution module focus on?,easy,9_Code_Execution.pdf,1.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+What specific programming language is used in the code execution examples in the Code Execution slides?,hard,9_Code_Execution.pdf,1.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+What topics or questions are covered in 'Alle Fragen 2.pdf'?,hard,Alle Fragen  2.pdf,1.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+Who is the author of 'Alle Fragen 2.pdf'?,hard,Alle Fragen  2.pdf,1.0,nan,0.0,1.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+What three machine learning models form the ensemble in the Apple Stock Forecaster MVP?,easy,Apple_Stock_Forecaster_PRD_MVP.pdf,1.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
+What is the target directional accuracy for the Apple Stock Forecaster MVP on the 2024 test set?,easy,Apple_Stock_Forecaster_PRD_MVP.pdf,1.0,nan,0.0,0.0,"Der bereitgestellte Kontext reicht nicht aus, um diese Frage zu beantworten."
