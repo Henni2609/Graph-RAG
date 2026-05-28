@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,9 +110,27 @@ JOB_EXECUTOR = ThreadPoolExecutor(
     max_workers=int(os.getenv("JOB_CONCURRENCY", "1")),
     thread_name_prefix="indexing-job",
 )
+# Bounded pool for best-effort PDF page pre-caching after indexing. A daemon
+# thread per document oversubscribed CPU/Tesseract on batch uploads.
+_PRECACHE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, (os.cpu_count() or 2) // 2),
+    thread_name_prefix="pdf-precache",
+)
 
-_PDF_PAGES_CACHE: dict[str, list[dict[str, Any]]] = {}
+# Bounded LRU: page extractions (incl. OCR text, often >1 MB) were previously
+# kept for the whole process lifetime, so closing a tab without /session/end
+# leaked memory unboundedly.
+_PDF_PAGES_CACHE_MAX = 64
+_PDF_PAGES_CACHE: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 _PDF_PAGES_CACHE_LOCK = threading.Lock()
+
+
+def _pdf_cache_store(document_id: str, pages: list[dict[str, Any]]) -> None:
+    with _PDF_PAGES_CACHE_LOCK:
+        _PDF_PAGES_CACHE[document_id] = pages
+        _PDF_PAGES_CACHE.move_to_end(document_id)
+        while len(_PDF_PAGES_CACHE) > _PDF_PAGES_CACHE_MAX:
+            _PDF_PAGES_CACHE.popitem(last=False)
 
 
 def _require_session_id(header_value: str | None) -> str:
@@ -188,7 +207,12 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     def _shutdown_jobs() -> None:
-        JOB_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        # Wait for running indexing jobs so Neo4j write sequences are not torn
+        # apart mid-persist, which would leave inconsistent chunk/entity graphs.
+        logger.info("Warte auf laufende Indexing-Jobs …")
+        JOB_EXECUTOR.shutdown(wait=True, cancel_futures=False)
+        # Best-effort precache: drop queued tasks, don't block shutdown on them.
+        _PRECACHE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
     @app.get("/")
     def index() -> FileResponse:
@@ -220,14 +244,15 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
         with _PDF_PAGES_CACHE_LOCK:
             cached = _PDF_PAGES_CACHE.get(document_id)
+            if cached is not None:
+                _PDF_PAGES_CACHE.move_to_end(document_id)
         if cached is None:
             try:
                 cached = _extract_pdf_pages(path, ocr_language=app_config.ocr_language)
             except Exception as exc:
                 logger.exception("PDF-Textextraktion fehlgeschlagen für %s", path)
                 raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
-            with _PDF_PAGES_CACHE_LOCK:
-                _PDF_PAGES_CACHE[document_id] = cached
+            _pdf_cache_store(document_id, cached)
         return {"document_id": document_id, "title": path.name, "pages": cached}
 
     @app.delete("/api/document/{document_id}")
@@ -374,11 +399,16 @@ async def _enqueue_upload(upload_files: list[UploadFile], config: RagConfig, ses
         filename = uf.filename or ""
         if not filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"Nur PDF-Dateien werden akzeptiert: {filename}")
-        contents = await uf.read()
-        if not contents:
+        # Read in 1 MB chunks and abort as soon as the limit is exceeded, so an
+        # oversized upload is never fully buffered into RAM/tmp before rejection.
+        buf = bytearray()
+        while chunk := await uf.read(1024 * 1024):
+            buf.extend(chunk)
+            if len(buf) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"Datei zu groß (max. 50 MB): {filename}")
+        if not buf:
             raise HTTPException(status_code=400, detail=f"Datei ist leer: {filename}")
-        if len(contents) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"Datei zu groß (max. 50 MB): {filename}")
+        contents = bytes(buf)
         safe_name = Path(filename).name or "upload.pdf"
         if safe_name in seen_names:
             raise HTTPException(status_code=400, detail=f"Doppelter Dateiname im Upload: {safe_name}")
@@ -482,12 +512,13 @@ def _run_indexing_job(job_id: str, pdf_paths: list[Path], config: RagConfig) -> 
                 for e, p in zip(INDEXING_JOBS[job_id].files, pdf_paths)
             } if job_id in INDEXING_JOBS else {}
         for doc_id, pdf_path in doc_id_to_path.items():
-            threading.Thread(
-                target=_precache_pdf_pages,
-                args=(doc_id, pdf_path, config.ocr_language, ocr_map.get(doc_id, {})),
-                name=f"pdf-precache-{doc_id[:8]}",
-                daemon=True,
-            ).start()
+            _PRECACHE_EXECUTOR.submit(
+                _precache_pdf_pages,
+                doc_id,
+                pdf_path,
+                config.ocr_language,
+                ocr_map.get(doc_id, {}),
+            )
         _update_job(
             job_id,
             status="done",
@@ -612,8 +643,7 @@ def _warmup_pdf_libs() -> None:
 def _precache_pdf_pages(document_id: str, path: Path, ocr_language: str, precomputed_ocr: dict[int, str] | None = None) -> None:
     try:
         pages = _extract_pdf_pages(path, ocr_language=ocr_language, precomputed_ocr=precomputed_ocr)
-        with _PDF_PAGES_CACHE_LOCK:
-            _PDF_PAGES_CACHE[document_id] = pages
+        _pdf_cache_store(document_id, pages)
         logger.info("PDF-Seiten vorgeladen für Dokument %s (%d Seiten)", document_id[:8], len(pages))
     except Exception:
         logger.exception("PDF-Vorladen fehlgeschlagen für Dokument %s", document_id[:8])

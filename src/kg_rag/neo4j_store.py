@@ -385,8 +385,8 @@ class Neo4jGraphStore:
         """Return the first chunk of each section whose title contains any keyword.
 
         Keywords must already be lower-cased by the caller. Only the lowest-index
-        chunk per matched section_title is returned so that each section contributes
-        a single, well-anchored context entry.
+        chunk per matched (document_id, section_title) is returned so that each
+        section of each document contributes a single, well-anchored context entry.
         """
         if not keywords:
             return []
@@ -399,7 +399,7 @@ class Neo4jGraphStore:
               AND ANY(kw IN $keywords WHERE toLower(c.section_title) CONTAINS kw)
             WITH c
             ORDER BY c.chunk_index ASC
-            WITH c.section_title AS section_title, collect(c)[0] AS fc
+            WITH c.document_id AS doc_id, c.section_title AS section_title, collect(c)[0] AS fc
             RETURN fc.id AS id,
                    fc.text AS text,
                    fc.chunk_index AS chunk_index,
