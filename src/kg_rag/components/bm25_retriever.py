@@ -47,8 +47,9 @@ class BM25Retriever:
         if cached is not None:
             return cached
         built = self._build_index(session_id)
-        if built[0] is None:
-            return built
+        # Cache the empty result too: a query against an empty/not-yet-indexed
+        # session otherwise hits Neo4j on every call. invalidate() clears this
+        # once indexing completes.
         with self.__class__._lock:
             existing = cache.get(session_id)
             if existing is not None:
