@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -116,8 +117,20 @@ _PRECACHE_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="pdf-precache",
 )
 
-_PDF_PAGES_CACHE: dict[str, list[dict[str, Any]]] = {}
+# Bounded LRU: page extractions (incl. OCR text, often >1 MB) were previously
+# kept for the whole process lifetime, so closing a tab without /session/end
+# leaked memory unboundedly.
+_PDF_PAGES_CACHE_MAX = 64
+_PDF_PAGES_CACHE: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 _PDF_PAGES_CACHE_LOCK = threading.Lock()
+
+
+def _pdf_cache_store(document_id: str, pages: list[dict[str, Any]]) -> None:
+    with _PDF_PAGES_CACHE_LOCK:
+        _PDF_PAGES_CACHE[document_id] = pages
+        _PDF_PAGES_CACHE.move_to_end(document_id)
+        while len(_PDF_PAGES_CACHE) > _PDF_PAGES_CACHE_MAX:
+            _PDF_PAGES_CACHE.popitem(last=False)
 
 
 def _require_session_id(header_value: str | None) -> str:
@@ -231,14 +244,15 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
         with _PDF_PAGES_CACHE_LOCK:
             cached = _PDF_PAGES_CACHE.get(document_id)
+            if cached is not None:
+                _PDF_PAGES_CACHE.move_to_end(document_id)
         if cached is None:
             try:
                 cached = _extract_pdf_pages(path, ocr_language=app_config.ocr_language)
             except Exception as exc:
                 logger.exception("PDF-Textextraktion fehlgeschlagen für %s", path)
                 raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
-            with _PDF_PAGES_CACHE_LOCK:
-                _PDF_PAGES_CACHE[document_id] = cached
+            _pdf_cache_store(document_id, cached)
         return {"document_id": document_id, "title": path.name, "pages": cached}
 
     @app.delete("/api/document/{document_id}")
@@ -629,8 +643,7 @@ def _warmup_pdf_libs() -> None:
 def _precache_pdf_pages(document_id: str, path: Path, ocr_language: str, precomputed_ocr: dict[int, str] | None = None) -> None:
     try:
         pages = _extract_pdf_pages(path, ocr_language=ocr_language, precomputed_ocr=precomputed_ocr)
-        with _PDF_PAGES_CACHE_LOCK:
-            _PDF_PAGES_CACHE[document_id] = pages
+        _pdf_cache_store(document_id, pages)
         logger.info("PDF-Seiten vorgeladen für Dokument %s (%d Seiten)", document_id[:8], len(pages))
     except Exception:
         logger.exception("PDF-Vorladen fehlgeschlagen für Dokument %s", document_id[:8])
