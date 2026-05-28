@@ -385,11 +385,16 @@ async def _enqueue_upload(upload_files: list[UploadFile], config: RagConfig, ses
         filename = uf.filename or ""
         if not filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"Nur PDF-Dateien werden akzeptiert: {filename}")
-        contents = await uf.read()
-        if not contents:
+        # Read in 1 MB chunks and abort as soon as the limit is exceeded, so an
+        # oversized upload is never fully buffered into RAM/tmp before rejection.
+        buf = bytearray()
+        while chunk := await uf.read(1024 * 1024):
+            buf.extend(chunk)
+            if len(buf) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"Datei zu groß (max. 50 MB): {filename}")
+        if not buf:
             raise HTTPException(status_code=400, detail=f"Datei ist leer: {filename}")
-        if len(contents) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"Datei zu groß (max. 50 MB): {filename}")
+        contents = bytes(buf)
         safe_name = Path(filename).name or "upload.pdf"
         if safe_name in seen_names:
             raise HTTPException(status_code=400, detail=f"Doppelter Dateiname im Upload: {safe_name}")
