@@ -4,6 +4,7 @@ import functools
 from typing import Any, AsyncGenerator
 
 from kg_rag.config import LLMConfig
+from kg_rag.logging import logger
 
 
 @functools.lru_cache(maxsize=None)
@@ -111,4 +112,7 @@ async def stream_chat_tokens(
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
     finally:
-        await stream.close()
+        try:
+            await stream.close()
+        except Exception as exc:
+            logger.debug(f"Stream close failed: {exc}")
