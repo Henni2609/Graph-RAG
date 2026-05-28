@@ -559,18 +559,16 @@ def _parse_single_pdf(args: tuple[Path, str, bool, str, int, int]) -> list[Docum
         logger.warning(f"Haystack PDF converter failed for {path}, using fallback: {exc}")
         from pypdf import PdfReader
 
-        text_docs = []
         reader = PdfReader(str(path))
-        for page_idx, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            if not text.strip():
-                continue
-            text_docs.append(make_document(
-                text,
-                meta={**_source_metadata(path, session_id=session_id), "page_number": page_idx},
-            ))
-            if ocr_min_text_chars > 0 and len(_clean_page_text(text)) >= ocr_min_text_chars:
-                covered_pages.add(page_idx)
+        pages_text = [(idx, page.extract_text() or "") for idx, page in enumerate(reader.pages, start=1)]
+        # Reuse the same form-feed-joined splitter as the happy path so section
+        # detection (section_title metadata) is applied in the fallback too.
+        full_text = "\x0c".join(text for _, text in pages_text)
+        text_docs = _split_into_pages(full_text, str(path), session_id)
+        if ocr_min_text_chars > 0:
+            for page_idx, text in pages_text:
+                if len(_clean_page_text(text)) >= ocr_min_text_chars:
+                    covered_pages.add(page_idx)
 
     if not ocr_enabled:
         return text_docs

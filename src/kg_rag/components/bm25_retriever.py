@@ -54,6 +54,7 @@ class BM25Retriever:
                 cls._cache.move_to_end(session_id)
                 return cached
         built = self._build_index(session_id)
+<<<<<<< HEAD
         if built[0] is None:
             return built
         with cls._lock:
@@ -65,6 +66,17 @@ class BM25Retriever:
             while len(cls._cache) > cls._MAX_CACHED_SESSIONS:
                 cls._cache.popitem(last=False)
         return built
+=======
+        # Cache the empty result too: a query against an empty/not-yet-indexed
+        # session otherwise hits Neo4j on every call. invalidate() clears this
+        # once indexing completes.
+        with self.__class__._lock:
+            existing = cache.get(session_id)
+            if existing is not None:
+                return existing
+            cache[session_id] = built
+            return built
+>>>>>>> 1eb0a3230a0199bd2459d49b918fce31606629f0
 
     def search(self, query: str, *, session_id: str, top_k: int = 60) -> list[Document]:
         try:
