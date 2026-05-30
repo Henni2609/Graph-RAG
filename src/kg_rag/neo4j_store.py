@@ -183,6 +183,9 @@ class Neo4jGraphStore:
                 "`vector.similarity_function`: 'cosine'"
                 "}}"
             ),
+            "CREATE INDEX chunk_session IF NOT EXISTS FOR (c:Chunk) ON (c.session_id)",
+            "CREATE INDEX document_session IF NOT EXISTS FOR (d:Document) ON (d.session_id)",
+            "CREATE INDEX entity_session IF NOT EXISTS FOR (e:Entity) ON (e.session_id)",
         ]
         for statement in statements:
             self.execute_write(statement)
