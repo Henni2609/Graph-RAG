@@ -252,8 +252,9 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
             try:
                 cached = _extract_pdf_pages(path, ocr_language=app_config.ocr_language)
             except Exception as exc:
-                logger.exception("PDF-Textextraktion fehlgeschlagen für %s", path)
-                raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden: {exc}") from exc
+                err_id = uuid.uuid4().hex[:12]
+                logger.exception("PDF-Textextraktion fehlgeschlagen für %s [err_id=%s]", path, err_id)
+                raise HTTPException(status_code=500, detail=f"Text konnte nicht extrahiert werden (Ref: {err_id})") from exc
             _pdf_cache_store(document_id, cached)
         return {"document_id": document_id, "title": path.name, "pages": cached}
 
@@ -269,8 +270,9 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         try:
             store.delete_document(session_id, document_id)
         except Exception as exc:
-            logger.exception("Dokument-Löschung fehlgeschlagen für %s", document_id)
-            raise HTTPException(status_code=500, detail=f"Löschen fehlgeschlagen: {exc}") from exc
+            err_id = uuid.uuid4().hex[:12]
+            logger.exception("Dokument-Löschung fehlgeschlagen für %s [err_id=%s]", document_id, err_id)
+            raise HTTPException(status_code=500, detail=f"Löschen fehlgeschlagen (Ref: {err_id})") from exc
         finally:
             store.close()
         _remove_pdf_manifest(session_id, document_id)
@@ -321,9 +323,10 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
                         hops=request.hops,
                         session_id=session_id,
                     )
-                except Exception as exc:
-                    logger.exception("Stream query retrieval failed")
-                    yield f"event: error\ndata: {json.dumps({'detail': f'Anfrage fehlgeschlagen: {exc}'})}\n\n"
+                except Exception:
+                    err_id = uuid.uuid4().hex[:12]
+                    logger.exception("Stream query retrieval failed [err_id=%s]", err_id)
+                    yield f"event: error\ndata: {json.dumps({'detail': f'Anfrage fehlgeschlagen (Ref: {err_id})'})}\n\n"
                     return
 
                 logger.info(f"TIMING stream_retrieval: {time.perf_counter() - t0:.3f}s")
@@ -381,8 +384,9 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
         try:
             store.delete_session(session_id)
         except Exception as exc:
-            logger.exception("Session cleanup failed")
-            raise HTTPException(status_code=500, detail=f"Session-Cleanup fehlgeschlagen: {exc}") from exc
+            err_id = uuid.uuid4().hex[:12]
+            logger.exception("Session cleanup failed [err_id=%s]", err_id)
+            raise HTTPException(status_code=500, detail=f"Session-Cleanup fehlgeschlagen (Ref: {err_id})") from exc
         finally:
             store.close()
         invalidate_embedding_meta(session_id)
@@ -779,8 +783,9 @@ def _handle_query(request: QueryRequest, config: RagConfig, session_id: str) -> 
             session_id=session_id,
         )
     except Exception as exc:
-        logger.exception("Query failed")
-        raise HTTPException(status_code=500, detail=f"Anfrage fehlgeschlagen: {exc}") from exc
+        err_id = uuid.uuid4().hex[:12]
+        logger.exception("Query failed [err_id=%s]", err_id)
+        raise HTTPException(status_code=500, detail=f"Anfrage fehlgeschlagen (Ref: {err_id})") from exc
     finally:
         pipeline.store.close()
 
@@ -798,8 +803,9 @@ def _fetch_graph(config: RagConfig, session_id: str) -> dict[str, Any]:
     try:
         return _fetch_graph_unsafe(config, session_id)
     except Exception as exc:
-        logger.exception("Graph fetch failed")
-        raise HTTPException(status_code=500, detail=f"Graph konnte nicht geladen werden: {exc}") from exc
+        err_id = uuid.uuid4().hex[:12]
+        logger.exception("Graph fetch failed [err_id=%s]", err_id)
+        raise HTTPException(status_code=500, detail=f"Graph konnte nicht geladen werden (Ref: {err_id})") from exc
 
 
 def _fetch_graph_unsafe(config: RagConfig, session_id: str) -> dict[str, Any]:
