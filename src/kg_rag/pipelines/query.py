@@ -509,18 +509,12 @@ class QueryPipeline:
 
 def sanitize_citations(answer: str, valid_indexes: set[int]) -> str:
     def _replace(m: re.Match) -> str:
-<<<<<<< HEAD
-        idx = int(m.group(2))
-        return m.group(1) if idx not in valid_indexes else m.group(0)
-    result = re.sub(r"(\s*)\[S(\d+)\]", _replace, answer)
-=======
         idx = int(m.group(1))
         return m.group(0) if idx in valid_indexes else ""
     # Consume horizontal whitespace before a tag so removing an invalid one does
     # not leave an orphan space. Newlines are preserved to keep paragraph breaks.
     result = re.sub(r"[ \t]*\[S(\d+)\]", _replace, answer)
     result = re.sub(r"[ \t]+([.,;:!?])", r"\1", result)
->>>>>>> 1eb0a3230a0199bd2459d49b918fce31606629f0
     return re.sub(r"[ \t]{2,}", " ", result)
 
 
