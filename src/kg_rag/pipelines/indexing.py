@@ -225,7 +225,17 @@ def split_documents(
             split_overlap=split_overlap,
         )
         cleaned = cleaner.run(documents=documents)["documents"]
-        return splitter.run(documents=cleaned)["documents"]
+        # Haystack's DocumentSplitter unconditionally overwrites page_number based on
+        # form-feed counts within each parent document. Our parents already represent
+        # a single page (no \f remaining), so each chunk would otherwise be tagged
+        # page 1. Restore the parent's page_number via the splitter's source_id link.
+        page_by_source = {d.id: document_meta(d).get("page_number") for d in cleaned}
+        splits = splitter.run(documents=cleaned)["documents"]
+        for split in splits:
+            src_page = page_by_source.get(document_meta(split).get("source_id"))
+            if src_page is not None:
+                split.meta["page_number"] = src_page
+        return splits
     except Exception as exc:
         logger.warning(f"Haystack splitter unavailable, using fallback sentence splitter: {exc}")
         return fallback_sentence_split(documents, split_length=split_length, split_overlap=split_overlap)
