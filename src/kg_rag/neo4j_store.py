@@ -426,6 +426,7 @@ class Neo4jGraphStore:
                    fc.title AS title,
                    fc.section_title AS section_title,
                    1.0 AS score
+            ORDER BY doc_id, section_title
             LIMIT $limit
             """,
             keywords=keywords,
