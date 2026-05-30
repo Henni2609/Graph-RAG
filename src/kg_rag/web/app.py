@@ -398,45 +398,58 @@ def create_app(config: RagConfig | None = None) -> FastAPI:
 
 
 async def _enqueue_upload(upload_files: list[UploadFile], config: RagConfig, session_id: str) -> dict[str, Any]:
-    # Validate and read all files first — reject the whole batch if any file fails.
-    validated: list[tuple[str, bytes]] = []
-    seen_names: set[str] = set()
-    for uf in upload_files:
-        filename = uf.filename or ""
-        if not filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"Nur PDF-Dateien werden akzeptiert: {filename}")
-        # Read in 1 MB chunks and abort as soon as the limit is exceeded, so an
-        # oversized upload is never fully buffered into RAM/tmp before rejection.
-        buf = bytearray()
-        while chunk := await uf.read(1024 * 1024):
-            buf.extend(chunk)
-            if len(buf) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail=f"Datei zu groß (max. 50 MB): {filename}")
-        if not buf:
-            raise HTTPException(status_code=400, detail=f"Datei ist leer: {filename}")
-        contents = bytes(buf)
-        safe_name = Path(filename).name or "upload.pdf"
-        if safe_name in seen_names:
-            raise HTTPException(status_code=400, detail=f"Doppelter Dateiname im Upload: {safe_name}")
-        seen_names.add(safe_name)
-        validated.append((safe_name, contents))
-
+    # Stream each file directly to disk — never buffer a whole file (let alone all
+    # files of the batch) in RAM. Reject the whole batch if any file fails, deleting
+    # files already written so no partial state remains.
     session_dir = UPLOADS_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
+    seen_names: set[str] = set()
     file_entries: list[FileEntry] = []
     pdf_paths: list[Path] = []
     manifest_entries: list[tuple[str, str]] = []
     estimated_total = 0
 
-    for safe_name, contents in validated:
-        pdf_path = session_dir / safe_name
-        pdf_path.write_bytes(contents)
-        document_id = stable_id(f"{session_id}|{str(pdf_path.resolve())}")
-        file_entries.append(FileEntry(filename=safe_name, document_id=document_id, status="queued"))
-        pdf_paths.append(pdf_path)
-        manifest_entries.append((document_id, safe_name))
-        estimated_total += _estimate_seconds(len(contents))
+    try:
+        for uf in upload_files:
+            filename = uf.filename or ""
+            if not filename.lower().endswith(".pdf"):
+                raise HTTPException(status_code=400, detail=f"Nur PDF-Dateien werden akzeptiert: {filename}")
+            safe_name = Path(filename).name or "upload.pdf"
+            if safe_name in seen_names:
+                raise HTTPException(status_code=400, detail=f"Doppelter Dateiname im Upload: {safe_name}")
+            seen_names.add(safe_name)
+
+            pdf_path = session_dir / safe_name
+            written = 0
+            try:
+                with pdf_path.open("wb") as fh:
+                    while chunk := await uf.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > MAX_UPLOAD_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"Datei zu groß (max. 50 MB): {filename}",
+                            )
+                        fh.write(chunk)
+            except BaseException:
+                pdf_path.unlink(missing_ok=True)
+                raise
+
+            if written == 0:
+                pdf_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=400, detail=f"Datei ist leer: {filename}")
+
+            document_id = stable_id(f"{session_id}|{str(pdf_path.resolve())}")
+            file_entries.append(FileEntry(filename=safe_name, document_id=document_id, status="queued"))
+            pdf_paths.append(pdf_path)
+            manifest_entries.append((document_id, safe_name))
+            estimated_total += _estimate_seconds(written)
+    except BaseException:
+        # Reject-whole-batch semantics: clean up any files that were already written.
+        for p in pdf_paths:
+            p.unlink(missing_ok=True)
+        raise
 
     _record_pdf_manifest(session_id, manifest_entries)
 
