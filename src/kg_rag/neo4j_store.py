@@ -287,7 +287,21 @@ class Neo4jGraphStore:
             if progress is not None:
                 progress("persisting", done, total_chunks)
 
-        # 2) Batch: Entities + MENTIONS
+        # 2a) Stale-MENTIONS-Cleanup: bei Re-Indexing existieren MENTIONS aus
+        # früheren Läufen weiter. Sie würden über MERGE in 2b nicht überschrieben,
+        # sondern akkumulieren als Geister-Mentions. Vor dem MERGE-Loop entfernen.
+        chunk_ids = list(chunk_metas.keys())
+        for batch_ids in _chunks_of(chunk_ids, batch_size * 10):
+            self.execute_write(
+                """
+                UNWIND $chunk_ids AS cid
+                MATCH (c:Chunk {id: cid})-[m:MENTIONS]->()
+                DELETE m
+                """,
+                chunk_ids=batch_ids,
+            )
+
+        # 2b) Batch: Entities + MENTIONS
         entities_payload: list[dict[str, Any]] = []
         for chunk_id, meta in chunk_metas.items():
             for entity in meta.get("entities") or []:
