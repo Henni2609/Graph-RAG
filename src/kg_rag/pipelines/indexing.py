@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import multiprocessing as mp
 import os
 import re
 from collections import defaultdict
@@ -607,7 +608,9 @@ def _load_pdf_documents(
     max_workers = min(len(files), cpu)
     # Distribute OCR threads across file processes to avoid oversubscribing cores.
     per_file_ocr_workers = max(1, cpu // len(files))
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    # Force spawn so a fork in a worker thread cannot inherit a locked mutex from
+    # another thread (loguru/logging/torch). Default is "fork" on Linux.
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn")) as executor:
         futures = [
             executor.submit(_parse_single_pdf, (f, session_id, ocr_enabled, ocr_language, per_file_ocr_workers, ocr_min_text_chars))
             for f in files
