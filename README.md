@@ -60,8 +60,9 @@ Die Web-UI ermöglicht Drag-and-Drop von PDFs und zeigt den wachsenden Wissensgr
   ┌─────────────────┐     ┌──────────────────┐    ┌──────────────────┐
   │ IndexingPipeline│     │  QueryPipeline   │    │   CLI (kg-rag)   │
   │  load → split → │     │  embed question →│    │  setup-schema /  │
-  │  embed → extract│     │  vector + section│    │  index / query / │
-  │  → persist      │     │  + graph + merge │    │  serve           │
+  │  embed → extract│     │  vector + BM25 + │    │  index / query / │
+  │  → persist      │     │  section + graph │    │  serve           │
+  │                 │     │  → rerank→ merge │    │                  │
   │                 │     │  → generate      │    │                  │
   └────────┬────────┘     └────────┬─────────┘    └────────┬─────────┘
            │                       │                       │
@@ -200,6 +201,9 @@ Außerdem wird die Frage auf **Abschnitts-Trigger** geprüft: Enthält sie Schl�
 **Schritt 2 — Vektorsuche**  
 Neo4j gibt die Top-k Chunks via `db.index.vector.queryNodes` zurück. Chunks unterhalb der Ähnlichkeitsschwelle (`MIN_SIMILARITY`, Standard 0,25) werden gefiltert. Abschnitts-gematchte Docs überspringen diese Schwelle.
 
+**Schritt 2b — BM25 + Reciprocal Rank Fusion (optional)**  
+Wenn `BM25_ENABLED=true` (Standard), werden parallel BM25-Ergebnisse via `rank-bm25` abgerufen (sitzungsisoliert, In-Memory-Index). Die Vektorsuchergebnisse und die BM25-Ergebnisse werden via **Reciprocal Rank Fusion** (RRF, k=60) zu einer einzigen Rangliste kombiniert: `score = Σ 1/(k + rank)`. Der BM25-Index wird nach jedem Indexierungsjob ungültig gemacht.
+
 **Schritt 3 — Graphsuche**  
 Von den Chunk-IDs der Vektorsuche und den normalisierten Fragen-Entitätsnamen wird traversiert:  
 `Chunk-[:MENTIONS]->Entity-[:RELATES_TO*1..h]->Entity<-[:MENTIONS]-Chunk`  
@@ -208,6 +212,9 @@ bis zu `h` Hops (Standard 2, begrenzt auf 1–3). Seed-Chunks werden ausgeschlos
 **Schritt 4 — Entitätskontext**  
 Direkte `RELATES_TO`-Nachbarn der Fragen-Entitäten werden als lesbare Zeilen gesammelt:  
 `Quelle --Relation--> Ziel`
+
+**Schritt 4b — Cross-Encoder-Reranking (optional)**  
+Wenn `RERANKER_ENABLED=true` (Standard), werden Vektor-Chunks und Graph-Chunks zu einem gemeinsamen Pool zusammengeführt. Abschnitts-gematchte Docs (`bypass_rerank=true`) überspringen den Reranker und werden vorne eingeordnet. Der Rest wird mit `BAAI/bge-reranker-base` (Cross-Encoder) nach Relevanz zur Frage neu bewertet. Nach dem Reranking begrenzt `PER_DOC_CHUNK_LIMIT` (Standard 5) die Anzahl der Chunks pro Dokument, um Dominanz einzelner Quellen zu vermeiden.
 
 **Schritt 5 — Merge**  
 Vektor-Chunks, Graph-Chunks und der Entitätskontext-Block werden unter einem `MAX_CONTEXT_CHARS`-Budget zusammengeführt. Deduplizierung nach `chunk_id`. Vektor-Chunks werden zuerst eingeordnet. Jedem Chunk-Abschnitt wird ein `[S1]`-Tag vorangestellt.
@@ -250,6 +257,10 @@ src/kg_rag/
 │   ├── entity_extractor.py       # @component — LLM-basierte JSON-Extraktion mit Validierung
 │   │                             #   Concurrent ThreadPoolExecutor, Retry-Logik
 │   ├── graph_retriever.py        # @component — graph_search + entity_context Wrapper
+│   ├── bm25_retriever.py         # BM25Retriever — rank-bm25 Volltextsuche, sitzungsisoliert
+│   │                             #   In-Memory-Index, wird nach jedem Job invalidiert
+│   ├── reranker.py               # CrossEncoderReranker — BAAI/bge-reranker-base
+│   │                             #   Cross-Encoder-basiertes Reranking (CPU/MPS), gecacht
 │   └── context_merger.py         # @component — Deduplizierung + Zeichenbudget-Merge
 │                                 #   + Citation-Index-Vergabe ([S1], [S2], …)
 ├── pipelines/
@@ -646,7 +657,7 @@ Alle Variablen können in `.env` gesetzt werden (wird beim Start geladen).
 | `EMBEDDING_MODEL`      | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | HuggingFace-Modell-ID. Muss 384-Dim-Vektoren erzeugen, um mit dem Vektorindex übereinzustimmen. Mehrsprachig: Deutsch + Englisch |
 | `EMBEDDING_DIMENSIONS` | `384`                                                         | Dimensionszahl des Vektorindex. Bei Wechsel des Embedding-Modells anpassen und alle Dokumente neu indexieren                     |
 | `EMBEDDING_BATCH_SIZE` | `64`                                                          | Anzahl Chunks pro Embedding-Batch. Erhöhen bei GPUs mit viel VRAM                                                                |
-| `EMBEDDING_DEVICE`     | `cpu`                                                         | `cpu`, `mps` (Apple Silicon), `cuda`, oder `auto` (erkennt MPS automatisch)                                                      |
+| `EMBEDDING_DEVICE`     | `auto`                                                        | `cpu`, `mps` (Apple Silicon), `cuda`, oder `auto` (erkennt MPS automatisch)                                                      |
 
 ### Indexierung
 
@@ -660,18 +671,26 @@ Alle Variablen können in `.env` gesetzt werden (wird beim Start geladen).
 | `ENTITY_MAX_TOKENS`          | `1200`    | Max. LLM-Output-Tokens für die Entitätsextraktion pro Chunk                                                               |
 | `OCR_ENABLED`                | `true`    | OCR für bild-basierte PDF-Seiten aktivieren. Erfordert Tesseract                                                          |
 | `OCR_LANGUAGE`               | `deu+eng` | Tesseract-Sprache(n). Mehrere via `+` verbinden                                                                           |
+| `OCR_MIN_TEXT_CHARS`         | `100`     | Mindestanzahl Zeichen pypdf-Text einer Seite, damit OCR für diese Seite übersprungen wird                                 |
+| `OCR_CONCURRENCY`            | `0`       | Threads für OCR pro Datei. `0` = automatisch (CPU-Anzahl)                                                                 |
 
 ### Abfrage
 
 | Variable                 | Standard | Beschreibung                                                                   |
 | ------------------------ | -------- | ------------------------------------------------------------------------------ |
-| `QUERY_TOP_K`            | `20`     | Vektor-Treffer vor der Graph-Erweiterung                                       |
+| `QUERY_TOP_K`            | `60`     | Vektor-Treffer vor der Graph-Erweiterung                                       |
 | `GRAPH_HOPS`             | `2`      | Graphtraversierungs-Tiefe. Wird auf 1–3 begrenzt                               |
 | `GRAPH_MAX_HOPS`         | `3`      | Absolute Obergrenze für Hops                                                   |
 | `GRAPH_LIMIT`            | `8`      | Max. Graph-Chunks pro Abfrage                                                  |
 | `MIN_SIMILARITY`         | `0.25`   | Cosine-Ähnlichkeitsschwelle. Chunks unterhalb dieser Schwelle werden verworfen |
 | `MAX_CONTEXT_CHARS`      | `16000`  | Zeichenbudget für den zusammengeführten Kontextblock                           |
-| `ANSWER_MAX_TOKENS`      | `1500`   | Max. LLM-Output-Tokens für die Antwortgenerierung                              |
+| `MAX_CONTEXT_TOKENS`     | `24000`  | Token-Budget für den zusammengeführten Kontextblock (tiktoken-basiert)         |
+| `BM25_ENABLED`           | `true`   | BM25-Volltextsuche aktivieren. Ergebnisse werden via RRF mit Vektorsuche kombiniert |
+| `RERANKER_ENABLED`       | `true`   | Cross-Encoder-Reranking nach Vektorsuche + Graphsuche aktivieren               |
+| `RERANKER_MODEL`         | `BAAI/bge-reranker-base` | HuggingFace-Modell-ID für den Cross-Encoder-Reranker              |
+| `RERANKER_TOP_K`         | `20`     | Anzahl der Top-Chunks, die nach dem Reranking behalten werden                  |
+| `PER_DOC_CHUNK_LIMIT`    | `5`      | Max. Chunks pro Dokument nach dem Reranking, um Dominanz einzelner Quellen zu vermeiden |
+| `ANSWER_MAX_TOKENS`      | `3000`   | Max. LLM-Output-Tokens für die Antwortgenerierung                              |
 | `ANSWER_TIMEOUT_SECONDS` | `60`     | Hartes Timeout (Sekunden) für den Antwort-LLM-Aufruf                           |
 | `ANSWER_MAX_RETRIES`     | `2`      | Wiederholungsversuche bei fehlgeschlagener Antwortgenerierung                  |
 
@@ -689,8 +708,10 @@ Alle Tests verwenden Fakes — kein Neo4j, kein Netz, kein LLM-Key nötig.
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `test_indexing_helpers.py`  | Lokales Parsen, Chunk-Metadaten-Normalisierung, Abschnittserkennung, ToC-Erkennung                                       |
 | `test_indexing_sections.py` | Satzbasiertes Splitting, Fallback-Splitter, Abschnittstitel-Einbettung                                                   |
+| `test_indexing_pipeline.py` | IndexingPipeline end-to-end mit Fake-Store und Fake-Extractor                                                            |
 | `test_context_merger.py`    | Deduplizierung von Chunks, Zeichenbudget, Citation-Index-Vergabe                                                         |
 | `test_entity_extractor.py`  | JSON-Parsing der Extraktion, Drop malformed relations, Parallelverarbeitung                                              |
+| `test_bm25_retriever.py`    | BM25Retriever-Suche, sitzungsisolierter Index, Cache-Invalidierung                                                       |
 | `test_neo4j_store.py`       | MERGE-Statements für Chunks, Entitäten, Relationen, NEXT_CHUNK; Hops-Begrenzung auf 1–3; section_title_search            |
 | `test_web_app.py`           | Graph-Payload-Form, Upload-Validierung (kein nicht-PDF, max. 50 MB), HTML-Serving, Query-Endpoint mit gemockter Pipeline |
 
@@ -714,8 +735,8 @@ Entitäten und typisierte Relationen werden als Graphstruktur persistiert, nicht
 **2. Strukturelles Abschnitts-Retrieval**  
 Fragen nach spezifischen Abschnitten (`Fazit`, `Methodik`, `Abstract` usw.) triggern eine strukturelle Suche nach `section_title` — unabhängig von Cosine-Ähnlichkeit. Das bedeutet: auch wenn die Frageformulierung semantisch weit vom Chunk-Inhalt liegt, wird der richtige Abschnitt gefunden.
 
-**3. Hybrides Retrieval**  
-Top-k Chunks kommen aus der Vektorsuche; weitere Chunks werden via Graphtraversierung über die Entitäten eingebracht, die diese Chunks erwähnen und die in der Frage selbst erkannt wurden. Beide Sets werden unter einem Zeichenbudget zusammengeführt.
+**3. Hybrides Retrieval mit BM25, RRF und Cross-Encoder-Reranking**  
+Top-k Chunks kommen aus der Vektorsuche. Parallel läuft eine BM25-Volltextsuche; beide Ranglisten werden via Reciprocal Rank Fusion (RRF) zu einem fusionierten Ranking kombiniert. Weitere Chunks werden via Graphtraversierung eingebracht. Der gemeinsame Pool wird durch einen Cross-Encoder-Reranker (`BAAI/bge-reranker-base`) nach tatsächlicher Relevanz zur Frage neu bewertet. Ein `PER_DOC_CHUNK_LIMIT` verhindert anschließend, dass einzelne Dokumente den Kontext dominieren.
 
 **Trade-offs:**
 
@@ -730,7 +751,6 @@ Top-k Chunks kommen aus der Vektorsuche; weitere Chunks werden via Graphtraversi
 - **Entitätsidentität:** `name_normalized` (casefold only). Aliase, Pluralformen und geringfügige Schreibvarianten werden als separate Entitäten behandelt.
 - **Upload-History:** Nur im Seitenkontext — setzt sich beim Reload zurück.
 - **Chat:** Single-Turn — kein Gesprächsverlauf wird ans LLM zurückgegeben.
-- **Kein Re-Ranking:** Zwischen Vektorergebnissen und LLM gibt es keine Re-Ranking-Stufe.
 - **Embedding-Modelwechsel:** Das Wechseln des Embedding-Modells nach der Indexierung führt zu einem Fehler bei der nächsten Abfrage. Alle Dokumente müssen neu indexiert werden.
 - **Einzelner Indexierungsjob:** Nur ein Indexierungsjob läuft gleichzeitig (1-Worker-ThreadPoolExecutor). Weitere Uploads werden in der Warteschlange gehalten.
 
