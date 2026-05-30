@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import multiprocessing as mp
 import os
 import re
 from collections import defaultdict
@@ -225,7 +226,17 @@ def split_documents(
             split_overlap=split_overlap,
         )
         cleaned = cleaner.run(documents=documents)["documents"]
-        return splitter.run(documents=cleaned)["documents"]
+        # Haystack's DocumentSplitter unconditionally overwrites page_number based on
+        # form-feed counts within each parent document. Our parents already represent
+        # a single page (no \f remaining), so each chunk would otherwise be tagged
+        # page 1. Restore the parent's page_number via the splitter's source_id link.
+        page_by_source = {d.id: document_meta(d).get("page_number") for d in cleaned}
+        splits = splitter.run(documents=cleaned)["documents"]
+        for split in splits:
+            src_page = page_by_source.get(document_meta(split).get("source_id"))
+            if src_page is not None:
+                split.meta["page_number"] = src_page
+        return splits
     except Exception as exc:
         logger.warning(f"Haystack splitter unavailable, using fallback sentence splitter: {exc}")
         return fallback_sentence_split(documents, split_length=split_length, split_overlap=split_overlap)
@@ -597,7 +608,9 @@ def _load_pdf_documents(
     max_workers = min(len(files), cpu)
     # Distribute OCR threads across file processes to avoid oversubscribing cores.
     per_file_ocr_workers = max(1, cpu // len(files))
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    # Force spawn so a fork in a worker thread cannot inherit a locked mutex from
+    # another thread (loguru/logging/torch). Default is "fork" on Linux.
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn")) as executor:
         futures = [
             executor.submit(_parse_single_pdf, (f, session_id, ocr_enabled, ocr_language, per_file_ocr_workers, ocr_min_text_chars))
             for f in files

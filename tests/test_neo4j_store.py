@@ -74,15 +74,17 @@ def test_persist_documents_writes_chunks_entities_relations_and_next_edges() -> 
     queries = "\n".join(cypher_calls)
     assert "UNWIND $chunks AS c" in queries
     assert "MERGE (chunk:Chunk {id: c.chunk_id})" in queries
+    assert "UNWIND $chunk_ids AS cid" in queries
+    assert "MATCH (c:Chunk {id: cid})-[m:MENTIONS]->()" in queries
     assert "UNWIND $entities AS row" in queries
     assert "MERGE (c)-[:MENTIONS]->(e)" in queries
     assert "UNWIND $relations AS row" in queries
     assert "MERGE (src)-[rel:RELATES_TO" in queries
     assert "UNWIND $pairs AS pair" in queries
     assert "MERGE (previous)-[:NEXT_CHUNK]->(current)" in queries
-    # Genau vier UNWIND-Batches (chunks, entities, relations, next-pairs).
-    # Pro Pipeline-Run, nicht pro Chunk.
-    assert len(cypher_calls) == 4
+    # Genau fünf UNWIND-Batches (chunks, mentions-cleanup, entities, relations,
+    # next-pairs). Pro Pipeline-Run, nicht pro Chunk.
+    assert len(cypher_calls) == 5
 
 
 def test_persist_documents_invokes_progress_callback() -> None:

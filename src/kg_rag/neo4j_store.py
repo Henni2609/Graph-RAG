@@ -183,6 +183,9 @@ class Neo4jGraphStore:
                 "`vector.similarity_function`: 'cosine'"
                 "}}"
             ),
+            "CREATE INDEX chunk_session IF NOT EXISTS FOR (c:Chunk) ON (c.session_id)",
+            "CREATE INDEX document_session IF NOT EXISTS FOR (d:Document) ON (d.session_id)",
+            "CREATE INDEX entity_session IF NOT EXISTS FOR (e:Entity) ON (e.session_id)",
         ]
         for statement in statements:
             self.execute_write(statement)
@@ -284,7 +287,21 @@ class Neo4jGraphStore:
             if progress is not None:
                 progress("persisting", done, total_chunks)
 
-        # 2) Batch: Entities + MENTIONS
+        # 2a) Stale-MENTIONS-Cleanup: bei Re-Indexing existieren MENTIONS aus
+        # früheren Läufen weiter. Sie würden über MERGE in 2b nicht überschrieben,
+        # sondern akkumulieren als Geister-Mentions. Vor dem MERGE-Loop entfernen.
+        chunk_ids = list(chunk_metas.keys())
+        for batch_ids in _chunks_of(chunk_ids, batch_size * 10):
+            self.execute_write(
+                """
+                UNWIND $chunk_ids AS cid
+                MATCH (c:Chunk {id: cid})-[m:MENTIONS]->()
+                DELETE m
+                """,
+                chunk_ids=batch_ids,
+            )
+
+        # 2b) Batch: Entities + MENTIONS
         entities_payload: list[dict[str, Any]] = []
         for chunk_id, meta in chunk_metas.items():
             for entity in meta.get("entities") or []:
@@ -409,6 +426,7 @@ class Neo4jGraphStore:
                    fc.title AS title,
                    fc.section_title AS section_title,
                    1.0 AS score
+            ORDER BY doc_id, section_title
             LIMIT $limit
             """,
             keywords=keywords,
