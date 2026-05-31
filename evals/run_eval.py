@@ -226,6 +226,31 @@ def _run_ragas(rag_results: list[dict[str, Any]], judge_model: str) -> Any:
 # Report generation
 # ---------------------------------------------------------------------------
 
+# Phrases the answer LLM uses when it correctly abstains (German + English).
+_ABSTENTION_MARKERS = (
+    "reicht nicht aus",
+    "kann nicht",
+    "lässt sich nicht",
+    "nicht beantwort",
+    "keine information",
+    "cannot be answered",
+    "not be answered",
+    "no information",
+)
+
+
+def _is_unanswerable(rag_result: dict[str, Any]) -> bool:
+    """A golden sample with no ground-truth contexts is a deliberate abstention
+    test case (image-only PDF, out-of-scope, statute-only text). Retrieval
+    precision/recall are not meaningful for it, so it is reported separately."""
+    return not rag_result.get("ground_truth_contexts")
+
+
+def _system_abstained(answer: str) -> bool:
+    low = answer.lower()
+    return any(marker in low for marker in _ABSTENTION_MARKERS)
+
+
 def _save_csv(rag_results: list[dict[str, Any]], eval_result: Any, output_path: Path) -> None:
     df = eval_result.to_pandas()
 
@@ -236,6 +261,7 @@ def _save_csv(rag_results: list[dict[str, Any]], eval_result: Any, output_path: 
             "question": r["question"],
             "difficulty": r["difficulty"],
             "source_doc": r["source_doc"],
+            "unanswerable": _is_unanswerable(r),
             "faithfulness": row.get("faithfulness", ""),
             "answer_relevancy": row.get("answer_relevancy", ""),
             "context_precision": row.get("context_precision", ""),
@@ -256,16 +282,24 @@ def _save_markdown(
 ) -> None:
     df = eval_result.to_pandas()
 
-    def _avg(col: str) -> str:
-        if col in df.columns:
-            vals = df[col].dropna()
-            return f"{vals.mean():.3f}" if len(vals) else "N/A"
-        return "N/A"
-
     metrics = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
 
+    answerable_idx = [i for i in range(len(rag_results)) if not _is_unanswerable(rag_results[i])]
+    unanswerable_idx = [i for i in range(len(rag_results)) if _is_unanswerable(rag_results[i])]
+
+    def _avg(col: str, idx: list[int]) -> str:
+        if col not in df.columns:
+            return "N/A"
+        vals = [
+            float(df.iloc[i][col])
+            for i in idx
+            if df.iloc[i].get(col) is not None and str(df.iloc[i].get(col)) != "nan"
+        ]
+        return f"{sum(vals) / len(vals):.3f}" if vals else "N/A"
+
     difficulty_rows: dict[str, dict[str, list[float]]] = {}
-    for i, row in df.iterrows():
+    for i in answerable_idx:
+        row = df.iloc[i]
         diff = rag_results[i]["difficulty"]
         if diff not in difficulty_rows:
             difficulty_rows[diff] = {m: [] for m in metrics}
@@ -281,19 +315,23 @@ def _save_markdown(
         "",
         f"**Date:** {now}  ",
         f"**Judge model:** {judge_model} (claude CLI)  ",
-        f"**Samples evaluated:** {len(rag_results)}",
+        f"**Samples evaluated:** {len(rag_results)} "
+        f"({len(answerable_idx)} answerable, {len(unanswerable_idx)} unanswerable)",
         "",
         "## Overall Scores",
+        "",
+        "_Computed over answerable questions only. Unanswerable (abstention) questions have "
+        "no ground-truth context and are reported separately below._",
         "",
         "| Metric | Score |",
         "|--------|-------|",
     ]
     for m in metrics:
-        lines.append(f"| {m.replace('_', ' ').title()} | {_avg(m)} |")
+        lines.append(f"| {m.replace('_', ' ').title()} | {_avg(m, answerable_idx)} |")
 
     lines += [
         "",
-        "## Scores by Difficulty",
+        "## Scores by Difficulty (answerable only)",
         "",
         "| Difficulty | Faithfulness | Answer Relevancy | Context Precision | Context Recall | N |",
         "|------------|-------------|-----------------|------------------|----------------|---|",
@@ -310,6 +348,35 @@ def _save_markdown(
             f"{_davg(d['context_precision'])} | {_davg(d['context_recall'])} | {n} |"
         )
 
+    # Abstention quality on unanswerable questions: retrieval precision/recall are not
+    # meaningful (there is no relevant context to find), so we instead check whether the
+    # system correctly abstained rather than hallucinating an answer.
+    if unanswerable_idx:
+        abstained = sum(
+            1 for i in unanswerable_idx if _system_abstained(rag_results[i]["answer"])
+        )
+        lines += [
+            "",
+            "## Unanswerable Questions (abstention check)",
+            "",
+            f"{len(unanswerable_idx)} questions have no answer in the source documents "
+            "(image-only PDFs, out-of-scope, statute-only text). The correct behaviour is to "
+            "abstain; these are excluded from the context precision/recall scores above.",
+            "",
+            f"**Correctly abstained:** {abstained}/{len(unanswerable_idx)}  ",
+            f"**Faithfulness (abstentions):** {_avg('faithfulness', unanswerable_idx)}",
+            "",
+            "| # | Question | Abstained | Faithfulness |",
+            "|---|----------|-----------|-------------|",
+        ]
+        for i in unanswerable_idx:
+            r = rag_results[i]
+            q = r["question"][:60].replace("|", "/")
+            ab = "yes" if _system_abstained(r["answer"]) else "**NO**"
+            fa_val = df.iloc[i].get("faithfulness")
+            fa = f"{fa_val:.2f}" if str(fa_val) != "nan" and fa_val is not None else "-"
+            lines.append(f"| {i + 1} | {q} | {ab} | {fa} |")
+
     lines += [
         "",
         "## Per-Question Scores",
@@ -320,11 +387,12 @@ def _save_markdown(
     for i, row in df.iterrows():
         r = rag_results[i]
         q = r["question"][:60].replace("|", "/")
+        diff = r["difficulty"] + (" ⚠️unans" if _is_unanswerable(r) else "")
         fa = f"{row.get('faithfulness', ''):.2f}" if str(row.get("faithfulness", "")) != "nan" else "-"
         ar = f"{row.get('answer_relevancy', ''):.2f}" if str(row.get("answer_relevancy", "")) != "nan" else "-"
         cp = f"{row.get('context_precision', ''):.2f}" if str(row.get("context_precision", "")) != "nan" else "-"
         cr = f"{row.get('context_recall', ''):.2f}" if str(row.get("context_recall", "")) != "nan" else "-"
-        lines.append(f"| {i + 1} | {q} | {r['difficulty']} | {fa} | {ar} | {cp} | {cr} |")
+        lines.append(f"| {i + 1} | {q} | {diff} | {fa} | {ar} | {cp} | {cr} |")
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"Markdown report saved: {output_path}")
