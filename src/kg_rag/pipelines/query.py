@@ -324,18 +324,20 @@ class QueryPipeline:
 
         # Re-rank combined pool and apply per-document chunk limit.
         # Section-matched docs (bypass_rerank=True) skip the cross-encoder and are
-        # prepended with their original priority intact.
-        if self.reranker is not None:
-            all_docs = vector_documents + graph_documents
-            if all_docs:
-                bypass = [d for d in all_docs if document_meta(d).get("bypass_rerank")]
-                to_rank = [d for d in all_docs if not document_meta(d).get("bypass_rerank")]
-                with log_timing("rerank"):
-                    ranked = self.reranker.rerank(question, to_rank) if to_rank else []
-                all_docs = bypass + ranked
-                all_docs = _per_doc_limit(all_docs, self.config.per_doc_chunk_limit)
-                vector_documents = [d for d in all_docs if document_meta(d).get("retrieval_source") != "graph"]
-                graph_documents = [d for d in all_docs if document_meta(d).get("retrieval_source") == "graph"]
+        # prepended with their original priority intact. per_doc_limit runs
+        # unconditionally so a single document cannot dominate the context pool
+        # when the reranker is disabled.
+        all_docs = vector_documents + graph_documents
+        if self.reranker is not None and all_docs:
+            bypass = [d for d in all_docs if document_meta(d).get("bypass_rerank")]
+            to_rank = [d for d in all_docs if not document_meta(d).get("bypass_rerank")]
+            with log_timing("rerank"):
+                ranked = self.reranker.rerank(question, to_rank) if to_rank else []
+            all_docs = bypass + ranked
+        if all_docs:
+            all_docs = _per_doc_limit(all_docs, self.config.per_doc_chunk_limit)
+            vector_documents = [d for d in all_docs if document_meta(d).get("retrieval_source") != "graph"]
+            graph_documents = [d for d in all_docs if document_meta(d).get("retrieval_source") == "graph"]
 
         # Only short-circuit when retrieval found literally nothing.
         # The system prompt handles the "context not sufficient" case for weak matches.
