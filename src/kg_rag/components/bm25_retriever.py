@@ -54,11 +54,8 @@ class BM25Retriever:
                 cls._cache.move_to_end(session_id)
                 return cached
         built = self._build_index(session_id)
-<<<<<<< HEAD
         if built[0] is None:
             return built
-=======
->>>>>>> b37738738a1acb52e3661de52311e3c82c228771
         with cls._lock:
             if cls._versions.get(session_id, 0) != v_before:
                 # Invalidation happened during build — don't cache a stale index.
