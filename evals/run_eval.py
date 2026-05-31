@@ -269,6 +269,10 @@ def _save_csv(rag_results: list[dict[str, Any]], eval_result: Any, output_path: 
             "answer": r["answer"][:300].replace("\n", " "),
         })
 
+    if not rows:
+        print(f"WARNING: no eval rows — skipping CSV export to {output_path}")
+        return
+
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
         writer.writeheader()
