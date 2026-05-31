@@ -75,8 +75,21 @@ def _extract_json_object(raw_text: str) -> str:
     if text.startswith("{") and text.endswith("}"):
         return text
 
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    return match.group(0) if match else ""
+    # Brace balancing: greedy `\{.*\}` would swallow trailing text and break
+    # JSON parsing whenever the LLM emits explanations or two objects.
+    start = text.find("{")
+    if start == -1:
+        return ""
+    depth = 0
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return ""
 
 
 @component
