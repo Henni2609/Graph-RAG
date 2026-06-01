@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
@@ -8,6 +9,15 @@ from kg_rag.compat import Document, make_document
 
 if TYPE_CHECKING:
     from kg_rag.neo4j_store import Neo4jGraphStore
+
+
+# Word-boundary tokenisation: keeps hyphenated/punctuated tokens like
+# "Graph-RAG" matchable against "graph rag" and ignores stray punctuation.
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall(text.lower())
 
 
 class BM25Retriever:
@@ -42,7 +52,7 @@ class BM25Retriever:
         records = list(records)
         if not records:
             return None, []
-        tokenized = [r["text"].lower().split() for r in records]
+        tokenized = [_tokenize(r["text"]) for r in records]
         return BM25Okapi(tokenized), records
 
     def _get_index(self, session_id: str) -> tuple[Any, list[dict]]:
@@ -73,7 +83,7 @@ class BM25Retriever:
             return []
         if bm25 is None or not records:
             return []
-        tokenized_query = query.lower().split()
+        tokenized_query = _tokenize(query)
         raw = bm25.get_scores(tokenized_query)
         scores = raw.tolist() if hasattr(raw, "tolist") else list(raw)
         top_indices = sorted(range(len(scores)), key=lambda i: -scores[i])[:top_k]
