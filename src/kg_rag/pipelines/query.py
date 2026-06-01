@@ -279,8 +279,12 @@ class QueryPipeline:
             try:
                 section_docs = section_future.result()
                 existing = {str(document_meta(d).get("chunk_id")): d for d in vector_documents}
+                processed_section_ids: set[str] = set()
                 for doc in section_docs:
                     cid = str(document_meta(doc).get("chunk_id"))
+                    if cid in processed_section_ids:
+                        continue
+                    processed_section_ids.add(cid)
                     if cid in existing:
                         # Chunk already retrieved by vector/BM25 — mark it for bypass in-place
                         # so the cross-encoder cannot demote it away from context.
@@ -297,6 +301,7 @@ class QueryPipeline:
                         if hasattr(doc, "meta"):
                             doc.meta = m
                         vector_documents.insert(0, doc)
+                        existing[cid] = doc
             except Exception as exc:
                 logger.warning(f"Section title search failed: {exc}")
 
