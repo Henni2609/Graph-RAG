@@ -72,11 +72,10 @@ def _extract_json_object(raw_text: str) -> str:
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
-    if text.startswith("{") and text.endswith("}"):
-        return text
-
     # Brace balancing: greedy `\{.*\}` would swallow trailing text and break
     # JSON parsing whenever the LLM emits explanations or two objects.
+    # Always run balancing — even a text that starts with `{` and ends with `}`
+    # may contain multiple objects or trailing prose between them.
     start = text.find("{")
     if start == -1:
         return ""
