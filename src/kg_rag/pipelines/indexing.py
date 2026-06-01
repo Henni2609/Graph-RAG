@@ -158,6 +158,13 @@ class IndexingPipeline:
         # model drift after the index has been built.
         self.store.store_indexing_meta(session_id, self.config.embedding_model, self.config.embedding_dimensions)
 
+        # Invalidate query-side caches before signalling "done": otherwise a
+        # query that races with the end of indexing could still hit a stale
+        # embedding-meta entry that was cached against the previous model.
+        # Local import to avoid a circular import (query.py imports from us).
+        from kg_rag.pipelines.query import invalidate_embedding_meta
+        invalidate_embedding_meta(session_id)
+
         emit("done", len(enriched_chunks), len(enriched_chunks))
         return len(enriched_chunks)
 
