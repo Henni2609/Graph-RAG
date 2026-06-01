@@ -441,15 +441,18 @@ class Neo4jGraphStore:
         *,
         top_k: int = 5,
         session_id: str = DEFAULT_SESSION_ID,
+        oversample_factor: int = 10,
     ) -> list[Document]:
-        # Session-scoped exact cosine: avoids cross-session crowding that breaks
-        # the global-queryNodes+post-filter pattern when multiple sessions share
-        # one index. vector.similarity.cosine() available since Neo4j 5.18.
+        # Use the HNSW vector index via db.index.vector.queryNodes and post-filter
+        # by session_id. Oversampling compensates for hits from other sessions
+        # that get filtered out — keeps recall close to the previous exact scan
+        # while keeping latency sub-linear in the total corpus size.
+        candidate_k = max(top_k, top_k * max(1, oversample_factor))
         records = self.execute_read(
-            """
-            MATCH (c:Chunk)
-            WHERE c.session_id = $session_id AND c.embedding IS NOT NULL
-            WITH c, vector.similarity.cosine(c.embedding, $embedding) AS score
+            f"""
+            CALL db.index.vector.queryNodes('{VECTOR_INDEX_NAME}', $candidate_k, $embedding)
+            YIELD node AS c, score
+            WHERE c.session_id = $session_id
             RETURN c.id AS id,
                    c.text AS text,
                    c.chunk_index AS chunk_index,
@@ -463,6 +466,7 @@ class Neo4jGraphStore:
             LIMIT $top_k
             """,
             top_k=top_k,
+            candidate_k=candidate_k,
             embedding=embedding,
             session_id=session_id,
         )
