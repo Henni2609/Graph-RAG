@@ -54,12 +54,12 @@ class BM25Retriever:
                 cls._cache.move_to_end(session_id)
                 return cached
         built = self._build_index(session_id)
-        if built[0] is None:
-            return built
         with cls._lock:
             if cls._versions.get(session_id, 0) != v_before:
                 # Invalidation happened during build — don't cache a stale index.
                 return built
+            # Cache empty results too — avoids re-running the Neo4j query on every
+            # search against an empty/not-yet-indexed session.
             cls._cache[session_id] = built
             cls._cache.move_to_end(session_id)
             while len(cls._cache) > cls._MAX_CACHED_SESSIONS:
